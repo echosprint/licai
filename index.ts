@@ -18,6 +18,10 @@ type ProdListResponse = {
 
 type ProdRow = { prodName: string; prodRegCode: string };
 
+const DEFAULT_WAIT_BETWEEN_PRODUCTS_MS = 8000; // default gap between products
+const MAX_RETRY_ATTEMPTS = 5;
+const INITIAL_RETRY_WAIT_MS = 8000;
+
 // Fetch a single product by name via the signed API request.
 async function fetchProduct(searchValue: string): Promise<ProdRow> {
   const initRes = await fetch(
@@ -106,8 +110,8 @@ async function delay(ms: number) {
 // Retry with exponential backoff to avoid transient 503/rate limits.
 async function fetchProductWithRetry(
   name: string,
-  maxAttempts = 5,
-  initialWaitMs = 8000
+  maxAttempts = MAX_RETRY_ATTEMPTS,
+  initialWaitMs = INITIAL_RETRY_WAIT_MS
 ): Promise<ProdRow> {
   let attempt = 0;
   let waitMs = initialWaitMs;
@@ -200,7 +204,7 @@ function parseArgs(): CliOptions {
     intervalMs:
       typeof opts.intervalMs === "number" && !Number.isNaN(opts.intervalMs)
         ? opts.intervalMs
-        : 1000,
+        : DEFAULT_WAIT_BETWEEN_PRODUCTS_MS,
   };
 }
 
@@ -244,7 +248,7 @@ async function main() {
       console.log(`Failed for "${name}" after retries: ${err}`);
     }
     if (i < names.length - 1) {
-      await delay(8000);
+      await delay(intervalMs || DEFAULT_WAIT_BETWEEN_PRODUCTS_MS);
     }
   }
 
