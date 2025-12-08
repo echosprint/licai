@@ -14,7 +14,10 @@ bun install
 ## Run
 ```bash
 bun run index.ts --input products.txt --output results.csv --interval 8
-# or positional: bun run index.ts products.txt results.csv 8
+# or use scripts:
+# bun start -- --input products.txt --output results.csv --interval 8
+# bun run fetch -- products.txt results.csv 8
+# positional form: bun run index.ts products.txt results.csv 8
 ```
 - `--input/-i`: text file, one product name per line (default: products.txt)
 - `--output/-o`: CSV output path (default: results.csv)
