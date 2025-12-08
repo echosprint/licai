@@ -1,6 +1,7 @@
 import { KJUR, KEYUTIL, hextob64 } from "jsrsasign";
 import { promises as fs } from "fs";
 import path from "path";
+import minimist from "minimist";
 
 const headers = {
   "User-Agent":
@@ -156,55 +157,38 @@ type CliOptions = {
 
 // Parse CLI flags/positionals.
 function parseArgs(): CliOptions {
-  const args = process.argv.slice(2);
-  const opts: Partial<CliOptions> = {};
+  const argv = minimist(process.argv.slice(2), {
+    alias: {
+      input: "i",
+      output: "o",
+      interval: "t", // seconds
+    },
+    string: ["input", "output", "interval"],
+    default: {
+      input: "products.txt",
+      output: "results.csv",
+    },
+  });
 
-  const argMap: Record<string, keyof CliOptions> = {
-    "--input": "input",
-    "-i": "input",
-    "--output": "output",
-    "-o": "output",
-    "--interval": "intervalMs", // seconds
-    "-t": "intervalMs", // seconds
-  };
+  const positional = argv._;
 
-  for (let idx = 0; idx < args.length; idx++) {
-    const arg = args[idx];
-    const key = argMap[arg as keyof typeof argMap];
-    if (key) {
-      const val = args[idx + 1];
-      idx++;
-      if (val === undefined) continue;
-      const valStr = String(val);
-      if (key === "intervalMs") {
-        const seconds = Number(valStr);
-        if (!Number.isNaN(seconds)) {
-          opts.intervalMs = seconds * 1000;
-        }
-      } else {
-        (opts as any)[key] = valStr;
-      }
-    } else if (!opts.input) {
-      // First bare argument as input file
-      opts.input = arg;
-    } else if (!opts.output) {
-      // Second bare argument as output file
-      opts.output = arg;
-    } else if (opts.intervalMs === undefined) {
-      const seconds = Number(arg);
-      if (!Number.isNaN(seconds)) {
-        opts.intervalMs = seconds * 1000;
-      }
-    }
-  }
+  const input =
+    (positional[0] ? String(positional[0]) : argv.input) ?? "products.txt";
+  const output =
+    (positional[1] ? String(positional[1]) : argv.output) ?? "results.csv";
+
+  const intervalCandidate =
+    argv.interval ?? (positional[2] !== undefined ? positional[2] : undefined);
+  const intervalSeconds = Number(intervalCandidate);
+  const intervalMs =
+    Number.isFinite(intervalSeconds) && intervalSeconds >= 0
+      ? intervalSeconds * 1000
+      : DEFAULT_WAIT_BETWEEN_PRODUCTS_MS;
 
   return {
-    input: opts.input ?? "products.txt",
-    output: opts.output ?? "results.csv",
-    intervalMs:
-      typeof opts.intervalMs === "number" && !Number.isNaN(opts.intervalMs)
-        ? opts.intervalMs
-        : DEFAULT_WAIT_BETWEEN_PRODUCTS_MS,
+    input,
+    output,
+    intervalMs,
   };
 }
 

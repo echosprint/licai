@@ -4,13 +4,16 @@
   "type": "module",
   "private": true,
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "@types/jsrsasign": "^10.5.15",
+    "@types/minimist": "^1.2.5"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
     "cheerio": "^1.1.2",
-    "jsrsasign": "^11.1.0"
+    "jsrsasign": "^11.1.0",
+    "minimist": "^1.2.8"
   }
 }
