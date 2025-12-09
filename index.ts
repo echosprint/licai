@@ -17,11 +17,55 @@ type ProdListResponse = {
   data?: { list?: any[]; total?: number };
 };
 
-type ProdRow = { prodName: string; prodRegCode: string };
+type ProdRow = { prodName: string; prodRegCode: string }; // prodRegCode can be empty if not found
 
 const DEFAULT_WAIT_BETWEEN_PRODUCTS_MS = 8000; // default gap between products
 const MAX_RETRY_ATTEMPTS = 5;
 const INITIAL_RETRY_WAIT_MS = 8000;
+
+// Remove special characters for similarity comparison
+function normalizeForComparison(str: string): string {
+  return str
+    .replace(/[()（）]/g, "")
+    .replace(/["""''']/g, "");
+}
+
+// Calculate longest common prefix length between two strings
+function longestCommonPrefixLength(a: string, b: string): number {
+  const normalizedA = normalizeForComparison(a);
+  const normalizedB = normalizeForComparison(b);
+  let i = 0;
+  while (
+    i < normalizedA.length &&
+    i < normalizedB.length &&
+    normalizedA[i] === normalizedB[i]
+  ) {
+    i++;
+  }
+  return i;
+}
+
+// Find the best matching product from multiple candidates
+function findBestMatch(searchTerm: string, candidates: any[]): any {
+  let bestMatch = candidates[0];
+  let bestScore = longestCommonPrefixLength(searchTerm, bestMatch.prodName);
+
+  for (let i = 1; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    const score = longestCommonPrefixLength(searchTerm, candidate.prodName);
+
+    // Use longest prefix, or shorter name as tie-breaker
+    if (
+      score > bestScore ||
+      (score === bestScore && candidate.prodName.length < bestMatch.prodName.length)
+    ) {
+      bestMatch = candidate;
+      bestScore = score;
+    }
+  }
+
+  return bestMatch;
+}
 
 // Fetch a single product by name via the signed API request.
 async function fetchProduct(searchValue: string): Promise<ProdRow> {
@@ -44,63 +88,85 @@ async function fetchProduct(searchValue: string): Promise<ProdRow> {
 
   const url =
     "https://xinxipilu.chinawealth.com.cn/lcxp-platService/product/getProductList";
-  const body = {
-    prodName: searchValue,
-    prodRegCode: "",
-    orgName: "",
-    pageNum: 1,
-    pageSize: 20,
-    prodStatus: "",
-    prodSpclAttr: "",
-    prodInvestNature: "",
-    prodOperateMode: "",
-    prodRiskLevel: "",
-    prodTermCode: "",
-    actDaysStart: null,
-    actDaysEnd: null,
+
+  // Helper function to perform API search with a given term
+  const searchByTerm = async (term: string): Promise<any[]> => {
+    const body = {
+      prodName: term,
+      prodRegCode: "",
+      orgName: "",
+      pageNum: 1,
+      pageSize: 20,
+      prodStatus: "",
+      prodSpclAttr: "",
+      prodInvestNature: "",
+      prodOperateMode: "",
+      prodRiskLevel: "",
+      prodTermCode: "",
+      actDaysStart: null,
+      actDaysEnd: null,
+    };
+
+    const signature =
+      licenseStr && typeof licenseStr === "string"
+        ? (() => {
+            try {
+              const key = KEYUTIL.getKey(licenseStr);
+              const sig = new KJUR.crypto.Signature({ alg: "SHA256withRSA" });
+              sig.init(key);
+              sig.updateString(JSON.stringify(body));
+              return hextob64(sig.sign());
+            } catch (e) {
+              console.warn("sign failed", e);
+              return null;
+            }
+          })()
+        : null;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        ...headers,
+        ...(setCookie ? { Cookie: setCookie } : {}),
+        ...(signature ? { signature } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Request failed: ${res.status} ${res.statusText}`);
+    }
+
+    const json = (await res.json()) as ProdListResponse;
+    return json.data?.list ?? [];
   };
 
-  const signature =
-    licenseStr && typeof licenseStr === "string"
-      ? (() => {
-          try {
-            const key = KEYUTIL.getKey(licenseStr);
-            const sig = new KJUR.crypto.Signature({ alg: "SHA256withRSA" });
-            sig.init(key);
-            sig.updateString(JSON.stringify(body));
-            return hextob64(sig.sign());
-          } catch (e) {
-            console.warn("sign failed", e);
-            return null;
-          }
-        })()
-      : null;
+  // Try searching with full product name
+  let results = await searchByTerm(searchValue);
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      ...headers,
-      ...(setCookie ? { Cookie: setCookie } : {}),
-      ...(signature ? { signature } : {}),
-    },
-    body: JSON.stringify(body),
-  });
+  // If no results, try with first 8 characters
+  if (results.length === 0) {
+    const prefix = searchValue.slice(0, 8);
+    console.log(
+      `No results for full name, trying first 8 chars: "${prefix}"`
+    );
+    await delay(DEFAULT_WAIT_BETWEEN_PRODUCTS_MS); // Wait before retry with prefix
+    results = await searchByTerm(prefix);
 
-  if (!res.ok) {
-    throw new Error(`Request failed: ${res.status} ${res.statusText}`);
+    if (results.length === 0) {
+      console.log(
+        `No products found for "${searchValue}" (tried full name and 8-char prefix), returning empty code`
+      );
+      return { prodName: searchValue, prodRegCode: "" };
+    }
   }
 
-  const json = (await res.json()) as ProdListResponse;
-  if (!json.data?.list?.length) {
-    throw new Error("No products found in response");
-  }
+  // Select best match from results
+  const selected =
+    results.length === 1 ? results[0] : findBestMatch(searchValue, results);
 
-  const first = json.data.list[0];
-  const prodRegCode = first?.prodRegCode;
-  const prodName = first?.prodName;
-  if (!prodRegCode || !prodName) {
-    throw new Error("prodRegCode or prodName missing in response");
-  }
+  const prodRegCode = selected?.prodRegCode ?? "";
+  const prodName = selected?.prodName ?? searchValue;
   return { prodName, prodRegCode };
 }
 
@@ -230,7 +296,8 @@ async function main() {
     try {
       const row = await fetchProductWithRetry(name);
       results.push(row);
-      console.log(`${row.prodName},${row.prodRegCode}`);
+      const displayCode = row.prodRegCode || "(empty)";
+      console.log(`${row.prodName},${displayCode}`);
     } catch (err) {
       console.log(`Failed for "${name}" after retries: ${err}`);
     }
