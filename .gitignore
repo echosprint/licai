@@ -8,6 +8,7 @@ dist
 
 # generated CSV output
 results.csv
+cookies.txt
 
 # code coverage
 coverage

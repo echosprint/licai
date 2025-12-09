@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# Configuration
+INPUT_FILE="products.txt"
+OUTPUT_FILE="results.csv"
+INTERVAL_SECONDS=8
+
 # Get private key once
 INIT_RESPONSE=$(curl -s -c cookies.txt -b cookies.txt \
   -X POST "https://xinxipilu.chinawealth.com.cn/lcxp-platService/product/getInitData" \
@@ -13,7 +18,7 @@ PRIVATE_KEY=$(echo "$PRIVATE_KEY_RAW" | \
 echo -e "$PRIVATE_KEY" > /tmp/private_key.pem
 
 # Initialize CSV output
-echo "prodName,prodRegCode" > results.csv
+echo "prodName,prodRegCode" > "$OUTPUT_FILE"
 
 # Prepare base request body template
 BODY_TEMPLATE='{
@@ -55,13 +60,13 @@ while IFS= read -r PRODUCT_NAME || [ -n "$PRODUCT_NAME" ]; do
   PROD_CODE=$(echo "$RESULT" | jq -r '.data.list[0].prodRegCode // empty')
 
   if [ -n "$PROD_NAME" ] && [ -n "$PROD_CODE" ]; then
-    echo "$PROD_NAME,$PROD_CODE" >> results.csv
+    echo "$PROD_NAME,$PROD_CODE" >> "$OUTPUT_FILE"
     echo "$PROD_NAME,$PROD_CODE"
   fi
 
-  sleep 8
+  sleep $INTERVAL_SECONDS
 
-done < products.txt
+done < "$INPUT_FILE"
 
 # Cleanup
 rm -f /tmp/private_key.pem cookies.txt
