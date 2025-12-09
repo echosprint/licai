@@ -39,6 +39,8 @@ BODY_TEMPLATE='{
 
 # Read from products.txt and process each line
 while IFS= read -r PRODUCT_NAME || [ -n "$PRODUCT_NAME" ]; do
+  # Clean up the product name: trim, remove quotes (English & Chinese), remove all spaces
+  PRODUCT_NAME=$(echo "$PRODUCT_NAME" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["'\''"'"'"'\'']*//' -e 's/["'\''"'"'"'\'']*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/[[:space:]]//g')
   [ -z "$PRODUCT_NAME" ] && continue
 
   # Update prodName in body (compact JSON, no spaces)

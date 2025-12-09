@@ -139,6 +139,9 @@ async function readLines(filePath: string): Promise<string[]> {
   return content
     .split(/\r?\n/)
     .map((l) => l.trim())
+    .map((l) => l.replace(/^["'"']|["'"']$/g, "")) // Remove leading/trailing quotes (English & Chinese)
+    .map((l) => l.trim()) // Trim again after removing quotes
+    .map((l) => l.replace(/\s+/g, "")) // Remove all spaces
     .filter((l) => l.length > 0);
 }
 
