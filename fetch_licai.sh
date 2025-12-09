@@ -36,10 +36,10 @@ BODY_TEMPLATE='{
 while IFS= read -r PRODUCT_NAME || [ -n "$PRODUCT_NAME" ]; do
   [ -z "$PRODUCT_NAME" ] && continue
 
-  # Update prodName in body
-  REQUEST_BODY=$(echo "$BODY_TEMPLATE" | jq --arg name "$PRODUCT_NAME" '.prodName = $name')
+  # Update prodName in body (compact JSON, no spaces)
+  REQUEST_BODY=$(echo "$BODY_TEMPLATE" | jq -c --arg name "$PRODUCT_NAME" '.prodName = $name')
 
-  # Step 3: Generate signature
+  # Generate signature
   SIGNATURE=$(echo -n "$REQUEST_BODY" | openssl dgst -sha256 -sign /tmp/private_key.pem | base64 | tr -d '\n')
 
   # Step 4: Make the API request
