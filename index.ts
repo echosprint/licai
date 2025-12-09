@@ -3,61 +3,198 @@ import { promises as fs } from "fs";
 import path from "path";
 import minimist from "minimist";
 
-const headers = {
+// ============================================================================
+// Type Definitions & Interfaces
+// ============================================================================
+
+/**
+ * Product information from the wealth management API
+ */
+interface Product {
+  prodName: string;
+  prodRegCode: string;
+}
+
+/**
+ * Response from the initialization endpoint containing RSA public key
+ */
+interface ApiInitResponse {
+  code?: number | string;
+  msg?: string;
+  data?: string; // RSA public key for signing requests
+}
+
+/**
+ * Response from the product search endpoint
+ */
+interface ProductListResponse {
+  code?: number | string;
+  msg?: string;
+  data?: {
+    list?: Product[];
+    total?: number;
+  };
+}
+
+/**
+ * Final product result (may have empty code if not found)
+ */
+interface ProductResult {
+  prodName: string;
+  prodRegCode: string; // Empty string if product not found
+}
+
+/**
+ * Command line arguments configuration
+ */
+interface CliOptions {
+  input: string;
+  output: string;
+  intervalMs: number;
+}
+
+/**
+ * Request body structure for product search API
+ */
+interface SearchRequest {
+  prodName: string;
+  prodRegCode: string;
+  orgName: string;
+  pageNum: number;
+  pageSize: number;
+  prodStatus: string;
+  prodSpclAttr: string;
+  prodInvestNature: string;
+  prodOperateMode: string;
+  prodRiskLevel: string;
+  prodTermCode: string;
+  actDaysStart: null;
+  actDaysEnd: null;
+}
+
+/**
+ * API credentials needed for making authenticated requests
+ */
+interface ApiCredentials {
+  publicKey: string | null;
+  cookie: string | null;
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/**
+ * API endpoint configuration
+ */
+const API_CONFIG = {
+  BASE_URL: "https://xinxipilu.chinawealth.com.cn",
+  ENDPOINTS: {
+    INIT: "/lcxp-platService/product/getInitData",
+    SEARCH: "/lcxp-platService/product/getProductList",
+  },
+  PAGE_SIZE: 20,
+} as const;
+
+/**
+ * Timing and retry configuration
+ */
+const TIMING_CONFIG = {
+  DEFAULT_INTERVAL_MS: 8000,
+  MAX_RETRY_ATTEMPTS: 5,
+  INITIAL_RETRY_WAIT_MS: 8000,
+  FALLBACK_SEARCH_DELAY_MS: 8000,
+  PREFIX_LENGTH: 8,
+} as const;
+
+/**
+ * HTTP headers for API requests
+ */
+const HTTP_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
   "Content-Type": "application/json;charset=UTF-8",
   Accept: "application/json, text/plain, */*",
-  Referer: "https://xinxipilu.chinawealth.com.cn/",
-};
+  Referer: API_CONFIG.BASE_URL,
+} as const;
 
-type ProdListResponse = {
-  code?: number | string;
-  msg?: string;
-  data?: { list?: any[]; total?: number };
-};
+// ============================================================================
+// Utility Functions
+// ============================================================================
 
-type ProdRow = { prodName: string; prodRegCode: string }; // prodRegCode can be empty if not found
-
-const DEFAULT_WAIT_BETWEEN_PRODUCTS_MS = 8000; // default gap between products
-const MAX_RETRY_ATTEMPTS = 5;
-const INITIAL_RETRY_WAIT_MS = 8000;
-
-// Remove special characters for similarity comparison
-function normalizeForComparison(str: string): string {
-  return str
-    .replace(/[()（）]/g, "")
-    .replace(/["""''']/g, "");
+/**
+ * Simple delay utility
+ * @param ms - Milliseconds to wait
+ */
+async function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Calculate longest common prefix length between two strings
+/**
+ * Remove special characters for similarity comparison.
+ * Removes: () （） " " " ' ' '
+ *
+ * @param str - Input string to normalize
+ * @returns Normalized string without special characters
+ */
+function normalizeForComparison(str: string): string {
+  return str.replace(/[()（）]/g, "").replace(/["""''']/g, "");
+}
+
+/**
+ * Calculate the longest common prefix length between two strings.
+ * Used for similarity matching between product names.
+ *
+ * @param a - First string to compare
+ * @param b - Second string to compare
+ * @returns Length of the matching prefix
+ */
 function longestCommonPrefixLength(a: string, b: string): number {
   const normalizedA = normalizeForComparison(a);
   const normalizedB = normalizeForComparison(b);
+
   let i = 0;
-  while (
-    i < normalizedA.length &&
-    i < normalizedB.length &&
-    normalizedA[i] === normalizedB[i]
-  ) {
+  const minLength = Math.min(normalizedA.length, normalizedB.length);
+
+  while (i < minLength && normalizedA[i] === normalizedB[i]) {
     i++;
   }
+
   return i;
 }
 
-// Find the best matching product from multiple candidates
-function findBestMatch(searchTerm: string, candidates: any[]): any {
-  let bestMatch = candidates[0];
+/**
+ * Find the best matching product from multiple candidates using longest common prefix algorithm.
+ * If multiple products have the same prefix length, prefer the shorter product name.
+ *
+ * @param searchTerm - The original search term to match against
+ * @param candidates - Array of products returned from API
+ * @returns The product with the longest matching prefix (shorter names win ties)
+ */
+function findBestMatch(searchTerm: string, candidates: Product[]): Product {
+  if (candidates.length === 0) {
+    throw new Error("Cannot find best match from empty candidates array");
+  }
+
+  const firstCandidate = candidates[0];
+  if (!firstCandidate) {
+    throw new Error("First candidate is undefined");
+  }
+
+  let bestMatch = firstCandidate;
   let bestScore = longestCommonPrefixLength(searchTerm, bestMatch.prodName);
 
   for (let i = 1; i < candidates.length; i++) {
     const candidate = candidates[i];
+    if (!candidate) continue;
+
     const score = longestCommonPrefixLength(searchTerm, candidate.prodName);
 
     // Use longest prefix, or shorter name as tie-breaker
     if (
       score > bestScore ||
-      (score === bestScore && candidate.prodName.length < bestMatch.prodName.length)
+      (score === bestScore &&
+        candidate.prodName.length < bestMatch.prodName.length)
     ) {
       bestMatch = candidate;
       bestScore = score;
@@ -67,164 +204,274 @@ function findBestMatch(searchTerm: string, candidates: any[]): any {
   return bestMatch;
 }
 
-// Fetch a single product by name via the signed API request.
-async function fetchProduct(searchValue: string): Promise<ProdRow> {
-  const initRes = await fetch(
-    "https://xinxipilu.chinawealth.com.cn/lcxp-platService/product/getInitData",
-    {
-      method: "POST",
-      headers,
-      body: "{}",
-    }
-  );
-  const initText = await initRes.text();
-  let licenseStr: string | null = null;
+// ============================================================================
+// API Functions
+// ============================================================================
+
+/**
+ * Get API credentials (RSA public key and session cookie) from the init endpoint.
+ * The public key is used to sign subsequent requests.
+ *
+ * @returns API credentials or null values if request fails
+ */
+async function getApiCredentials(): Promise<ApiCredentials> {
+  const url = `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.INIT}`;
+
   try {
-    const parsed = JSON.parse(initText);
-    licenseStr = parsed?.data ?? null;
-  } catch {
-  }
-  const setCookie = initRes.headers.get("set-cookie");
-
-  const url =
-    "https://xinxipilu.chinawealth.com.cn/lcxp-platService/product/getProductList";
-
-  // Helper function to perform API search with a given term
-  const searchByTerm = async (term: string): Promise<any[]> => {
-    const body = {
-      prodName: term,
-      prodRegCode: "",
-      orgName: "",
-      pageNum: 1,
-      pageSize: 20,
-      prodStatus: "",
-      prodSpclAttr: "",
-      prodInvestNature: "",
-      prodOperateMode: "",
-      prodRiskLevel: "",
-      prodTermCode: "",
-      actDaysStart: null,
-      actDaysEnd: null,
-    };
-
-    const signature =
-      licenseStr && typeof licenseStr === "string"
-        ? (() => {
-            try {
-              const key = KEYUTIL.getKey(licenseStr);
-              const sig = new KJUR.crypto.Signature({ alg: "SHA256withRSA" });
-              sig.init(key);
-              sig.updateString(JSON.stringify(body));
-              return hextob64(sig.sign());
-            } catch (e) {
-              console.warn("sign failed", e);
-              return null;
-            }
-          })()
-        : null;
-
-    const res = await fetch(url, {
+    const response = await fetch(url, {
       method: "POST",
-      headers: {
-        ...headers,
-        ...(setCookie ? { Cookie: setCookie } : {}),
-        ...(signature ? { signature } : {}),
-      },
-      body: JSON.stringify(body),
+      headers: HTTP_HEADERS,
+      body: "{}",
     });
 
-    if (!res.ok) {
-      throw new Error(`Request failed: ${res.status} ${res.statusText}`);
+    const text = await response.text();
+    const cookie = response.headers.get("set-cookie");
+
+    let publicKey: string | null = null;
+    try {
+      const parsed = JSON.parse(text) as ApiInitResponse;
+      publicKey = parsed?.data ?? null;
+    } catch (error) {
+      console.warn("Failed to parse init response:", error);
     }
 
-    const json = (await res.json()) as ProdListResponse;
-    return json.data?.list ?? [];
+    return { publicKey, cookie };
+  } catch (error) {
+    console.warn("Failed to get API credentials:", error);
+    return { publicKey: null, cookie: null };
+  }
+}
+
+/**
+ * Create an RSA-SHA256 signature for the request body.
+ *
+ * @param body - Request body object to sign
+ * @param publicKey - RSA public key for signing
+ * @returns Base64-encoded signature or null if signing fails
+ */
+function createSignature(
+  body: SearchRequest,
+  publicKey: string | null
+): string | null {
+  if (!publicKey || typeof publicKey !== "string") {
+    return null;
+  }
+
+  try {
+    const key = KEYUTIL.getKey(publicKey);
+    const sig = new KJUR.crypto.Signature({ alg: "SHA256withRSA" });
+    sig.init(key);
+    sig.updateString(JSON.stringify(body));
+    return hextob64(sig.sign());
+  } catch (error) {
+    console.warn("Failed to create signature:", error);
+    return null;
+  }
+}
+
+/**
+ * Search for products by name using the signed API.
+ *
+ * @param searchTerm - Product name to search for
+ * @param credentials - API credentials (public key and cookie)
+ * @returns Array of matching products (empty if none found)
+ */
+async function searchProducts(
+  searchTerm: string,
+  credentials: ApiCredentials
+): Promise<Product[]> {
+  const url = `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.SEARCH}`;
+
+  const requestBody: SearchRequest = {
+    prodName: searchTerm,
+    prodRegCode: "",
+    orgName: "",
+    pageNum: 1,
+    pageSize: API_CONFIG.PAGE_SIZE,
+    prodStatus: "",
+    prodSpclAttr: "",
+    prodInvestNature: "",
+    prodOperateMode: "",
+    prodRiskLevel: "",
+    prodTermCode: "",
+    actDaysStart: null,
+    actDaysEnd: null,
   };
 
-  // Try searching with full product name
-  let results = await searchByTerm(searchValue);
+  const signature = createSignature(requestBody, credentials.publicKey);
 
-  // If no results, try with first 8 characters
+  const headers = {
+    ...HTTP_HEADERS,
+    ...(credentials.cookie ? { Cookie: credentials.cookie } : {}),
+    ...(signature ? { signature } : {}),
+  };
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(requestBody),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status} ${response.statusText}`);
+  }
+
+  const json = (await response.json()) as ProductListResponse;
+  return json.data?.list ?? [];
+}
+
+// ============================================================================
+// Core Logic
+// ============================================================================
+
+/**
+ * Fetch product information by name with intelligent fallback.
+ *
+ * Flow:
+ * 1. Search with full product name
+ * 2. If no results, wait and try with first 8 characters
+ * 3. If multiple results, use similarity matching to find best match
+ * 4. If still no results, return empty code
+ *
+ * @param productName - Product name to search for
+ * @returns Product result (may have empty prodRegCode if not found)
+ */
+async function fetchProduct(productName: string): Promise<ProductResult> {
+  const credentials = await getApiCredentials();
+
+  // Try searching with full product name
+  let results = await searchProducts(productName, credentials);
+
+  // If no results, try with first N characters
   if (results.length === 0) {
-    const prefix = searchValue.slice(0, 8);
+    const prefix = productName.slice(0, TIMING_CONFIG.PREFIX_LENGTH);
     console.log(
-      `No results for full name, trying first 8 chars: "${prefix}"`
+      `No results for full name, trying first ${TIMING_CONFIG.PREFIX_LENGTH} chars: "${prefix}"`
     );
-    await delay(DEFAULT_WAIT_BETWEEN_PRODUCTS_MS); // Wait before retry with prefix
-    results = await searchByTerm(prefix);
+
+    await delay(TIMING_CONFIG.FALLBACK_SEARCH_DELAY_MS);
+    results = await searchProducts(prefix, credentials);
 
     if (results.length === 0) {
       console.log(
-        `No products found for "${searchValue}" (tried full name and 8-char prefix), returning empty code`
+        `No products found for "${productName}" (tried full name and ${TIMING_CONFIG.PREFIX_LENGTH}-char prefix), returning empty code`
       );
-      return { prodName: searchValue, prodRegCode: "" };
+      return { prodName: productName, prodRegCode: "" };
     }
   }
 
   // Select best match from results
   const selected =
-    results.length === 1 ? results[0] : findBestMatch(searchValue, results);
+    results.length === 1 ? results[0] : findBestMatch(productName, results);
 
-  const prodRegCode = selected?.prodRegCode ?? "";
-  const prodName = selected?.prodName ?? searchValue;
-  return { prodName, prodRegCode };
+  if (!selected) {
+    throw new Error("Selected product is undefined");
+  }
+
+  return {
+    prodName: selected.prodName,
+    prodRegCode: selected.prodRegCode ?? "",
+  };
 }
 
-async function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// Retry with exponential backoff to avoid transient 503/rate limits.
+/**
+ * Fetch product with retry logic and exponential backoff.
+ * Helps handle transient errors and rate limits.
+ *
+ * @param productName - Product name to search for
+ * @param maxAttempts - Maximum number of retry attempts
+ * @param initialWaitMs - Initial wait time before first retry
+ * @returns Product result
+ * @throws Error if all retry attempts fail
+ */
 async function fetchProductWithRetry(
-  name: string,
-  maxAttempts = MAX_RETRY_ATTEMPTS,
-  initialWaitMs = INITIAL_RETRY_WAIT_MS
-): Promise<ProdRow> {
+  productName: string,
+  maxAttempts = TIMING_CONFIG.MAX_RETRY_ATTEMPTS,
+  initialWaitMs = TIMING_CONFIG.INITIAL_RETRY_WAIT_MS
+): Promise<ProductResult> {
   let attempt = 0;
   let waitMs = initialWaitMs;
+
   while (attempt < maxAttempts) {
     attempt++;
     try {
-      return await fetchProduct(name);
-    } catch (err) {
-      if (attempt >= maxAttempts) throw err;
+      return await fetchProduct(productName);
+    } catch (error) {
+      if (attempt >= maxAttempts) {
+        throw error;
+      }
+
       console.log(
-        `retry ${attempt}/${maxAttempts} for "${name}" after ${Math.round(
+        `Retry ${attempt}/${maxAttempts} for "${productName}" after ${Math.round(
           waitMs / 1000
         )}s`
       );
+
       await delay(waitMs);
-      waitMs *= 2;
+      waitMs *= 2; // Exponential backoff
     }
   }
+
   throw new Error(`Failed to fetch after ${maxAttempts} attempts`);
 }
 
+// ============================================================================
+// File I/O Functions
+// ============================================================================
+
+/**
+ * Read and parse product names from input file.
+ * Cleans up lines by:
+ * - Trimming whitespace
+ * - Removing quotes (English & Chinese)
+ * - Removing all spaces
+ *
+ * @param filePath - Path to input file
+ * @returns Array of cleaned product names
+ */
 async function readLines(filePath: string): Promise<string[]> {
   const content = await fs.readFile(filePath, "utf8");
+
   return content
     .split(/\r?\n/)
-    .map((l) => l.trim())
-    .map((l) => l.replace(/^["'"']|["'"']$/g, "")) // Remove leading/trailing quotes (English & Chinese)
-    .map((l) => l.trim()) // Trim again after removing quotes
-    .map((l) => l.replace(/\s+/g, "")) // Remove all spaces
-    .filter((l) => l.length > 0);
+    .map((line) => line.trim())
+    .map((line) => line.replace(/^["'"']|["'"']$/g, "")) // Remove quotes
+    .map((line) => line.trim())
+    .map((line) => line.replace(/\s+/g, "")) // Remove all spaces
+    .filter((line) => line.length > 0);
 }
 
-async function writeCsv(rows: ProdRow[], outputPath: string) {
+/**
+ * Write product results to CSV file.
+ *
+ * @param rows - Array of product results
+ * @param outputPath - Path to output CSV file
+ */
+async function writeCsv(
+  rows: ProductResult[],
+  outputPath: string
+): Promise<void> {
   const header = "prodName,prodRegCode";
-  const lines = rows.map((r) => `${r.prodName},${r.prodRegCode}`);
+  const lines = rows.map((row) => `${row.prodName},${row.prodRegCode}`);
   const csv = [header, ...lines].join("\n");
+
   await fs.writeFile(outputPath, csv, "utf8");
 }
 
-type CliOptions = {
-  input: string;
-  output: string;
-  intervalMs: number;
-};
+// ============================================================================
+// CLI Argument Parsing
+// ============================================================================
 
-// Parse CLI flags/positionals.
+/**
+ * Parse command line arguments.
+ * Supports both named flags and positional arguments.
+ *
+ * Examples:
+ * - bun index.ts --input products.txt --output results.csv --interval 8
+ * - bun index.ts products.txt results.csv 8
+ *
+ * @returns Parsed CLI options
+ */
 function parseArgs(): CliOptions {
   const argv = minimist(process.argv.slice(2), {
     alias: {
@@ -252,7 +499,7 @@ function parseArgs(): CliOptions {
   const intervalMs =
     Number.isFinite(intervalSeconds) && intervalSeconds >= 0
       ? intervalSeconds * 1000
-      : DEFAULT_WAIT_BETWEEN_PRODUCTS_MS;
+      : TIMING_CONFIG.DEFAULT_INTERVAL_MS;
 
   return {
     input,
@@ -261,8 +508,18 @@ function parseArgs(): CliOptions {
   };
 }
 
-// Main flow: read names -> fetch each with retries -> write CSV.
-async function main() {
+// ============================================================================
+// Main Execution
+// ============================================================================
+
+/**
+ * Main execution flow:
+ * 1. Parse command line arguments
+ * 2. Read product names from input file
+ * 3. Fetch each product with retries and pacing
+ * 4. Write results to CSV
+ */
+async function main(): Promise<void> {
   const { input: inputFile, output: outputFile, intervalMs } = parseArgs();
 
   if (Number.isNaN(intervalMs) || intervalMs < 0) {
@@ -270,48 +527,59 @@ async function main() {
     process.exit(1);
   }
 
-  let names: string[];
+  // Read product names from input file
+  let productNames: string[];
   try {
-    names = await readLines(inputFile);
-  } catch (err: any) {
-    if (err?.code === "ENOENT") {
+    productNames = await readLines(inputFile);
+  } catch (error: unknown) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       console.error(`Input file not found: ${inputFile}`);
       console.error(
         "Usage: bun index.ts [--input products.txt] [--output results.csv] [--interval seconds]"
       );
       process.exit(1);
     }
-    throw err;
+    throw error;
   }
-  if (names.length === 0) {
+
+  if (productNames.length === 0) {
     console.error("Input file is empty.");
     process.exit(1);
   }
 
-  const results: ProdRow[] = [];
+  console.log(`Processing ${productNames.length} products...`);
 
-  for (let i = 0; i < names.length; i++) {
-    const name = names[i];
-    if (!name) continue;
+  // Fetch each product with retries and pacing
+  const results: ProductResult[] = [];
+
+  for (let i = 0; i < productNames.length; i++) {
+    const productName = productNames[i];
+    if (!productName) continue;
+
     try {
-      const row = await fetchProductWithRetry(name);
-      results.push(row);
-      const displayCode = row.prodRegCode || "(empty)";
-      console.log(`${row.prodName},${displayCode}`);
-    } catch (err) {
-      console.log(`Failed for "${name}" after retries: ${err}`);
+      const result = await fetchProductWithRetry(productName);
+      results.push(result);
+
+      const displayCode = result.prodRegCode || "(empty)";
+      console.log(`${result.prodName},${displayCode}`);
+    } catch (error) {
+      console.log(`Failed for "${productName}" after retries: ${error}`);
     }
-    if (i < names.length - 1) {
-      await delay(intervalMs || DEFAULT_WAIT_BETWEEN_PRODUCTS_MS);
+
+    // Wait between products (except after last one)
+    if (i < productNames.length - 1) {
+      await delay(intervalMs);
     }
   }
 
-  const outPath = path.resolve(outputFile);
-  await writeCsv(results, outPath);
-  console.log(`Written ${results.length} rows to ${outPath}`);
+  // Write results to CSV
+  const outputPath = path.resolve(outputFile);
+  await writeCsv(results, outputPath);
+  console.log(`\nWritten ${results.length} rows to ${outputPath}`);
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
+// Run main function
+main().catch((error: unknown) => {
+  console.error("Fatal error:", error);
   process.exit(1);
 });
