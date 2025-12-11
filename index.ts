@@ -318,6 +318,9 @@ async function fetchProduct(
   credentials: ApiCredentials
 ): Promise<ProductResult> {
 
+  // Increment attempt count once per call
+  item.attemptCount++;
+
   let results: Product[] = [];
 
   // If haven't tried full name yet, only search with full name
@@ -328,13 +331,11 @@ async function fetchProduct(
       // If empty, mark as tried and throw to re-queue for prefix search
       if (results.length === 0) {
         item.triedFullName = true;
-        item.attemptCount++;
         console.log(`No results for full name "${item.name}", will retry with prefix`);
         throw new Error("Empty results for full name search");
       }
     } catch (error) {
-      // Network error on full name search - don't mark triedFullName yet
-      item.attemptCount++;
+      // Re-throw for retry
       throw error;
     }
   } else {
@@ -345,24 +346,19 @@ async function fetchProduct(
       `Trying prefix search (first ${prefixLength} chars): "${prefix}"`
     );
 
-    // Wait before fallback search to avoid rate limiting
-    await delay(2000);
-
     try {
       results = await searchProducts(prefix, credentials);
 
       if (results.length === 0) {
-        // Both full name and prefix failed - mark as complete with empty result
-        item.attemptCount++;
-        item.success = true; // Completed successfully (with empty result)
+        // Both full name and prefix failed - mark as failed
+        item.success = false;
         console.log(
           `No products found for "${item.name}" (tried both full name and prefix), returning empty code`
         );
         return { prodName: item.name, prodRegCode: "" };
       }
     } catch (error) {
-      // Network error on prefix search
-      item.attemptCount++;
+      // Re-throw for retry
       throw error;
     }
   }
@@ -371,15 +367,13 @@ async function fetchProduct(
   const selected = results.length === 1 ? results[0] : findExactMatch(item.name, results);
 
   if (!selected) {
-    // No exact match - mark as complete with empty result
-    item.attemptCount++;
-    item.success = true; // Completed successfully (with empty result)
+    // No exact match - mark as failed
+    item.success = false;
     console.log(`No exact match found for "${item.name}", returning empty code`);
     return { prodName: item.name, prodRegCode: "" };
   }
 
   // Successfully found product
-  item.attemptCount++;
   item.success = true;
   return {
     prodName: selected.prodName,
