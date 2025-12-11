@@ -111,9 +111,10 @@ const API_CONFIG = {
 const TIMING_CONFIG = {
   DEFAULT_INTERVAL_MS: 8000,
   MAX_RETRY_ATTEMPTS: 5,
-  INITIAL_RETRY_WAIT_MS: 8000,
-  FALLBACK_SEARCH_DELAY_MS: 8000,
-  PREFIX_LENGTH: 8,
+  RETRY_INITIAL_DELAY_MS: 1000, // Start with 1 second for exponential backoff
+  FALLBACK_SEARCH_PREFIX_LENGTH: 8,
+  CREDENTIAL_FETCH_COOLDOWN_MS: 2000, // 2s between credential requests
+  GLOBAL_REQUEST_COOLDOWN_MS: 1000, // Minimum 1s between ANY requests
 } as const;
 
 /**
@@ -133,63 +134,92 @@ const HTTP_HEADERS = {
 
 /**
  * Session pool manager for reusing API sessions with rate limiting.
- * Maintains a pool of sessions, each with its own 8s cooldown period.
+ *
+ * How it works:
+ * - Maintains a pool of sessions, each with cached API credentials
+ * - Each session has its own cooldown period (e.g., 8s between uses)
+ * - When all sessions are busy, waits for the oldest one to become available
+ * - This allows N concurrent requests while respecting per-session rate limits
+ *
+ * Example with 4 sessions and 8s cooldown:
+ *   Request 1-4: Use sessions 1-4 immediately (no wait)
+ *   Request 5: Wait for session 1 to cool down (~8s)
+ *   Request 6: Wait for session 2 to cool down (minimal wait)
  */
 class SessionPool {
   private sessions: Session[] = [];
-  private maxSessions: number;
-  private intervalMs: number;
+  private readonly maxSessions: number;
+  private readonly cooldownIntervalMs: number;
 
-  constructor(maxSessions: number, intervalMs: number) {
+  constructor(maxSessions: number, cooldownIntervalMs: number) {
     this.maxSessions = maxSessions;
-    this.intervalMs = intervalMs;
+    this.cooldownIntervalMs = cooldownIntervalMs;
   }
 
   /**
-   * Get a session from the pool.
-   * - If pool < max: create new session slot with fresh credentials
-   * - If pool >= max: reuse oldest session (wait if needed for rate limit cooldown)
+   * Get an available session from the pool.
+   * Creates new sessions up to maxSessions, then reuses oldest available session.
+   *
+   * @returns Session with credentials ready to use
    */
   async getSession(): Promise<Session> {
     const now = Date.now();
 
-    // If pool not full, create new session slot with credentials
+    // Create new session if pool not yet full
     if (this.sessions.length < this.maxSessions) {
-      console.log(`Creating new session slot (${this.sessions.length + 1}/${this.maxSessions})...`);
-
-      // Fetch credentials (rate limiting handled inside getApiCredentials)
-      const credentials = await getApiCredentials();
-
-      const session: Session = {
-        credentials,
-        lastUsedAt: Date.now(), // Mark as used immediately
-      };
-      this.sessions.push(session);
-      return session;
+      return await this.createNewSession();
     }
 
-    // Pool is full - find oldest session
+    // Pool is full - find and wait for oldest session
+    return await this.reuseOldestSession(now);
+  }
+
+  /**
+   * Create a new session with fresh credentials
+   */
+  private async createNewSession(): Promise<Session> {
+    const sessionNumber = this.sessions.length + 1;
+    console.log(`Creating new session slot (${sessionNumber}/${this.maxSessions})...`);
+
+    // Fetch credentials (rate limiting handled inside getApiCredentials)
+    const credentials = await getApiCredentials();
+
+    const session: Session = {
+      credentials,
+      lastUsedAt: Date.now(), // Mark as used immediately to prevent race conditions
+    };
+
+    this.sessions.push(session);
+    return session;
+  }
+
+  /**
+   * Reuse the oldest session after waiting for its cooldown if needed
+   */
+  private async reuseOldestSession(currentTime: number): Promise<Session> {
+    // Find session that was used longest ago
     const oldestSession = this.sessions.reduce((oldest, current) =>
       current.lastUsedAt < oldest.lastUsedAt ? current : oldest
     );
 
-    // Wait if necessary to respect rate limit cooldown
-    const timeSinceLastUse = now - oldestSession.lastUsedAt;
-    const waitTime = this.intervalMs - timeSinceLastUse;
+    // Calculate if we need to wait for cooldown
+    const timeSinceLastUse = currentTime - oldestSession.lastUsedAt;
+    const remainingCooldown = this.cooldownIntervalMs - timeSinceLastUse;
 
-    if (waitTime > 0) {
-      console.log(`Waiting ${Math.round(waitTime / 1000)}s for session cooldown...`);
-      await delay(waitTime);
+    if (remainingCooldown > 0) {
+      const waitSeconds = Math.round(remainingCooldown / 1000);
+      console.log(`Waiting ${waitSeconds}s for session cooldown...`);
+      await delay(remainingCooldown);
     }
 
-    // Mark session as used when we allocate it
+    // Mark session as used now
     oldestSession.lastUsedAt = Date.now();
 
     return oldestSession;
   }
 
   /**
-   * Get current pool size
+   * Get current pool size (for statistics)
    */
   getPoolSize(): number {
     return this.sessions.length;
@@ -210,13 +240,13 @@ async function delay(ms: number): Promise<void> {
 
 /**
  * Remove special characters for similarity comparison.
- * Removes: () （） " " " ' ' '
+ * Removes: () （） " " " ' ' ' and spaces
  *
  * @param str - Input string to normalize
- * @returns Normalized string without special characters
+ * @returns Normalized string without special characters or spaces
  */
 function normalizeForComparison(str: string): string {
-  return str.replace(/[()（）]/g, "").replace(/["""''']/g, "");
+  return str.replace(/[()（）]/g, "").replace(/["""''']/g, "").replace(/\s+/g, "");
 }
 
 /**
@@ -250,20 +280,56 @@ function findExactMatch(searchTerm: string, candidates: Product[]): Product | nu
 }
 
 // ============================================================================
-// API Functions
+// Rate Limiting Management
 // ============================================================================
 
 /**
- * Track last credential fetch time to enforce rate limiting
+ * Global rate limiter to enforce minimum delays between API requests.
+ * Prevents overwhelming the server with too many requests.
  */
-let lastCredentialFetchTime = 0;
-const CREDENTIAL_FETCH_COOLDOWN_MS = 2000; // 2s between credential requests
+class RateLimiter {
+  private lastCredentialFetchTime = 0;
+  private lastApiRequestTime = 0;
 
-/**
- * Track last API request time for global rate limiting
- */
-let lastApiRequestTime = 0;
-const GLOBAL_REQUEST_COOLDOWN_MS = 1000; // Minimum 1s between ANY requests
+  /**
+   * Wait if needed before fetching credentials
+   */
+  async waitForCredentialFetch(): Promise<void> {
+    const now = Date.now();
+    const timeSinceLastFetch = now - this.lastCredentialFetchTime;
+    const waitTime = TIMING_CONFIG.CREDENTIAL_FETCH_COOLDOWN_MS - timeSinceLastFetch;
+
+    if (this.lastCredentialFetchTime > 0 && waitTime > 0) {
+      console.log(`[Credentials] Waiting ${Math.round(waitTime / 1000)}s before fetching...`);
+      await delay(waitTime);
+    }
+
+    this.lastCredentialFetchTime = Date.now();
+  }
+
+  /**
+   * Wait if needed before making an API request
+   */
+  async waitForApiRequest(): Promise<void> {
+    const now = Date.now();
+    const timeSinceLastRequest = now - this.lastApiRequestTime;
+    const waitTime = TIMING_CONFIG.GLOBAL_REQUEST_COOLDOWN_MS - timeSinceLastRequest;
+
+    if (this.lastApiRequestTime > 0 && waitTime > 0) {
+      console.log(`[Global] Waiting ${Math.round(waitTime / 1000)}s between requests...`);
+      await delay(waitTime);
+    }
+
+    this.lastApiRequestTime = Date.now();
+  }
+}
+
+// Global rate limiter instance
+const globalRateLimiter = new RateLimiter();
+
+// ============================================================================
+// API Functions
+// ============================================================================
 
 /**
  * Get API credentials (RSA public key and session cookie) from the init endpoint.
@@ -273,15 +339,9 @@ const GLOBAL_REQUEST_COOLDOWN_MS = 1000; // Minimum 1s between ANY requests
  * @returns API credentials or null values if request fails
  */
 async function getApiCredentials(): Promise<ApiCredentials> {
-  // Rate limiting: wait if needed before fetching credentials
-  const now = Date.now();
-  const timeSinceLastFetch = now - lastCredentialFetchTime;
-  const waitTime = CREDENTIAL_FETCH_COOLDOWN_MS - timeSinceLastFetch;
+  // Apply rate limiting before fetching
+  await globalRateLimiter.waitForCredentialFetch();
 
-  if (lastCredentialFetchTime > 0 && waitTime > 0) {
-    console.log(`[Credentials] Waiting ${Math.round(waitTime / 1000)}s before fetching...`);
-    await delay(waitTime);
-  }
   const url = `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.INIT}`;
 
   try {
@@ -302,16 +362,9 @@ async function getApiCredentials(): Promise<ApiCredentials> {
       console.warn("Failed to parse init response:", error);
     }
 
-    // Record fetch time for rate limiting
-    lastCredentialFetchTime = Date.now();
-
     return { publicKey, cookie };
   } catch (error) {
     console.warn("Failed to get API credentials:", error);
-
-    // Record fetch time even on error
-    lastCredentialFetchTime = Date.now();
-
     return { publicKey: null, cookie: null };
   }
 }
@@ -357,15 +410,8 @@ async function searchProducts(
   // Get session from pool (waits if necessary, marks as used immediately)
   const session = await sessionPool.getSession();
 
-  // Global rate limiting: enforce minimum delay between ANY requests
-  const now = Date.now();
-  const timeSinceLastRequest = now - lastApiRequestTime;
-  const globalWaitTime = GLOBAL_REQUEST_COOLDOWN_MS - timeSinceLastRequest;
-
-  if (lastApiRequestTime > 0 && globalWaitTime > 0) {
-    console.log(`[Global] Waiting ${Math.round(globalWaitTime / 1000)}s between requests...`);
-    await delay(globalWaitTime);
-  }
+  // Apply global rate limiting before making request
+  await globalRateLimiter.waitForApiRequest();
 
   // Use cached credentials from session
   const credentials = session.credentials;
@@ -402,9 +448,6 @@ async function searchProducts(
     body: JSON.stringify(requestBody),
   });
 
-  // Record request time for global rate limiting
-  lastApiRequestTime = Date.now();
-
   if (!response.ok) {
     throw new Error(`Request failed: ${response.status} ${response.statusText}`);
   }
@@ -438,18 +481,20 @@ async function fetchProduct(
   // Try searching with full product name
   let results = await searchProducts(productName, sessionPool);
 
-  // If no results, try with first N characters
+  // If no results, try with first N characters as fallback
   if (results.length === 0) {
-    const prefix = productName.slice(0, TIMING_CONFIG.PREFIX_LENGTH);
+    const prefixLength = TIMING_CONFIG.FALLBACK_SEARCH_PREFIX_LENGTH;
+    const prefix = productName.slice(0, prefixLength);
     console.log(
-      `No results for full name, trying first ${TIMING_CONFIG.PREFIX_LENGTH} chars: "${prefix}"`
+      `No results for full name, trying first ${prefixLength} chars: "${prefix}"`
     );
 
     results = await searchProducts(prefix, sessionPool);
 
     if (results.length === 0) {
+      const prefixLength = TIMING_CONFIG.FALLBACK_SEARCH_PREFIX_LENGTH;
       console.log(
-        `No products found for "${productName}" (tried full name and ${TIMING_CONFIG.PREFIX_LENGTH}-char prefix), returning empty code`
+        `No products found for "${productName}" (tried full name and ${prefixLength}-char prefix), returning empty code`
       );
       return { prodName: productName, prodRegCode: "" };
     }
@@ -485,7 +530,7 @@ async function fetchProductWithRetry(
   maxAttempts = TIMING_CONFIG.MAX_RETRY_ATTEMPTS
 ): Promise<ProductResult> {
   let attempt = 0;
-  let retryDelayMs = 1000; // Start with 1 second
+  let retryDelayMs = TIMING_CONFIG.RETRY_INITIAL_DELAY_MS; // Start with 1 second, doubles each retry
 
   while (attempt < maxAttempts) {
     attempt++;
