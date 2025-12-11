@@ -111,10 +111,9 @@ const API_CONFIG = {
 const TIMING_CONFIG = {
   DEFAULT_INTERVAL_MS: 8000,
   MAX_RETRY_ATTEMPTS: 5,
-  RETRY_INITIAL_DELAY_MS: 1000, // Start with 1 second for exponential backoff
   FALLBACK_SEARCH_PREFIX_LENGTH: 8,
-  CREDENTIAL_FETCH_COOLDOWN_MS: 2000, // 2s between credential requests
-  GLOBAL_REQUEST_COOLDOWN_MS: 1000, // Minimum 1s between ANY requests
+  CREDENTIAL_FETCH_COOLDOWN_MS: 2000, // Initial delay between credential requests (adaptive)
+  GLOBAL_REQUEST_COOLDOWN_MS: 1000, // Initial minimum delay between requests (adaptive)
 } as const;
 
 /**
@@ -284,23 +283,41 @@ function findExactMatch(searchTerm: string, candidates: Product[]): Product | nu
 // ============================================================================
 
 /**
- * Global rate limiter to enforce minimum delays between API requests.
- * Prevents overwhelming the server with too many requests.
+ * Adaptive rate limiter that learns from API responses.
+ * Automatically adjusts timing based on success/failure patterns:
+ * - Increases delays when hitting rate limits (503, 429 errors)
+ * - Decreases delays when requests succeed consistently
+ * - Self-tunes to find optimal throughput without triggering limits
  */
-class RateLimiter {
+class AdaptiveRateLimiter {
   private lastCredentialFetchTime = 0;
   private lastApiRequestTime = 0;
 
+  // Adaptive timing (explicitly typed as number to allow dynamic adjustment)
+  private currentCredentialDelay: number = TIMING_CONFIG.CREDENTIAL_FETCH_COOLDOWN_MS;
+  private currentRequestDelay: number = TIMING_CONFIG.GLOBAL_REQUEST_COOLDOWN_MS;
+
+  // Success/failure tracking
+  private recentSuccesses = 0;
+  private recentFailures = 0;
+  private readonly ADAPTATION_WINDOW = 5; // Evaluate every 5 requests
+
+  // Min/max bounds for adaptive timing
+  private readonly MIN_REQUEST_DELAY = 500;   // 0.5s minimum
+  private readonly MAX_REQUEST_DELAY = 5000;  // 5s maximum
+  private readonly MIN_CREDENTIAL_DELAY = 1000; // 1s minimum
+  private readonly MAX_CREDENTIAL_DELAY = 10000; // 10s maximum
+
   /**
-   * Wait if needed before fetching credentials
+   * Wait before fetching credentials (with adaptive timing)
    */
   async waitForCredentialFetch(): Promise<void> {
     const now = Date.now();
     const timeSinceLastFetch = now - this.lastCredentialFetchTime;
-    const waitTime = TIMING_CONFIG.CREDENTIAL_FETCH_COOLDOWN_MS - timeSinceLastFetch;
+    const waitTime = this.currentCredentialDelay - timeSinceLastFetch;
 
     if (this.lastCredentialFetchTime > 0 && waitTime > 0) {
-      console.log(`[Credentials] Waiting ${Math.round(waitTime / 1000)}s before fetching...`);
+      console.log(`[Credentials] Waiting ${Math.round(waitTime / 1000)}s (adaptive: ${Math.round(this.currentCredentialDelay / 1000)}s)`);
       await delay(waitTime);
     }
 
@@ -308,24 +325,84 @@ class RateLimiter {
   }
 
   /**
-   * Wait if needed before making an API request
+   * Wait before making an API request (with adaptive timing)
    */
   async waitForApiRequest(): Promise<void> {
     const now = Date.now();
     const timeSinceLastRequest = now - this.lastApiRequestTime;
-    const waitTime = TIMING_CONFIG.GLOBAL_REQUEST_COOLDOWN_MS - timeSinceLastRequest;
+    const waitTime = this.currentRequestDelay - timeSinceLastRequest;
 
     if (this.lastApiRequestTime > 0 && waitTime > 0) {
-      console.log(`[Global] Waiting ${Math.round(waitTime / 1000)}s between requests...`);
+      console.log(`[Adaptive] Waiting ${Math.round(waitTime / 1000)}s (delay: ${Math.round(this.currentRequestDelay / 1000)}s)`);
       await delay(waitTime);
     }
 
     this.lastApiRequestTime = Date.now();
   }
+
+  /**
+   * Report a successful API request
+   * Gradually decreases delays on consistent success
+   */
+  reportSuccess(): void {
+    this.recentSuccesses++;
+    this.recentFailures = Math.max(0, this.recentFailures - 1);
+
+    // Every N successful requests, try reducing delay
+    if (this.recentSuccesses >= this.ADAPTATION_WINDOW) {
+      this.recentSuccesses = 0;
+
+      // Speed up by 10%
+      this.currentRequestDelay = Math.max(
+        this.MIN_REQUEST_DELAY,
+        Math.round(this.currentRequestDelay * 0.9)
+      );
+
+      console.log(`[Adaptive] 🎯 Speeding up: request delay now ${Math.round(this.currentRequestDelay / 1000)}s`);
+    }
+  }
+
+  /**
+   * Report a rate limit error (503, 429, etc.)
+   * Immediately increases delays to back off
+   */
+  reportRateLimit(): void {
+    this.recentFailures++;
+    this.recentSuccesses = 0;
+
+    // Back off aggressively: increase by 50%
+    this.currentRequestDelay = Math.min(
+      this.MAX_REQUEST_DELAY,
+      Math.round(this.currentRequestDelay * 1.5)
+    );
+
+    this.currentCredentialDelay = Math.min(
+      this.MAX_CREDENTIAL_DELAY,
+      Math.round(this.currentCredentialDelay * 1.5)
+    );
+
+    console.log(`[Adaptive] ⚠️  Rate limited! Backing off: request=${Math.round(this.currentRequestDelay / 1000)}s, credential=${Math.round(this.currentCredentialDelay / 1000)}s`);
+  }
+
+  /**
+   * Get current timing stats (for debugging)
+   */
+  getStats(): { requestDelay: number; credentialDelay: number; successRate: string } {
+    const total = this.recentSuccesses + this.recentFailures;
+    const successRate = total > 0
+      ? `${Math.round((this.recentSuccesses / total) * 100)}%`
+      : 'N/A';
+
+    return {
+      requestDelay: this.currentRequestDelay,
+      credentialDelay: this.currentCredentialDelay,
+      successRate,
+    };
+  }
 }
 
-// Global rate limiter instance
-const globalRateLimiter = new RateLimiter();
+// Global adaptive rate limiter instance
+const globalRateLimiter = new AdaptiveRateLimiter();
 
 // ============================================================================
 // API Functions
@@ -448,11 +525,21 @@ async function searchProducts(
     body: JSON.stringify(requestBody),
   });
 
+  // Check for rate limiting responses
+  if (response.status === 429 || response.status === 503) {
+    globalRateLimiter.reportRateLimit();
+    throw new Error(`Rate limited: ${response.status} ${response.statusText}`);
+  }
+
   if (!response.ok) {
     throw new Error(`Request failed: ${response.status} ${response.statusText}`);
   }
 
   const json = (await response.json()) as ProductListResponse;
+
+  // Report success to adaptive rate limiter
+  globalRateLimiter.reportSuccess();
+
   return json.data?.list ?? [];
 }
 
@@ -515,8 +602,9 @@ async function fetchProduct(
 }
 
 /**
- * Fetch product with retry logic and exponential backoff.
- * Helps handle transient errors and rate limits.
+ * Fetch product with retry logic.
+ * Retries failed requests without additional delays.
+ * The adaptive rate limiter handles all timing adjustments automatically.
  *
  * @param productName - Product name to search for
  * @param sessionPool - Session pool for managing rate limiting
@@ -530,7 +618,6 @@ async function fetchProductWithRetry(
   maxAttempts = TIMING_CONFIG.MAX_RETRY_ATTEMPTS
 ): Promise<ProductResult> {
   let attempt = 0;
-  let retryDelayMs = TIMING_CONFIG.RETRY_INITIAL_DELAY_MS; // Start with 1 second, doubles each retry
 
   while (attempt < maxAttempts) {
     attempt++;
@@ -541,13 +628,8 @@ async function fetchProductWithRetry(
         throw error;
       }
 
-      console.log(
-        `Retry ${attempt}/${maxAttempts} for "${productName}" after ${retryDelayMs / 1000}s`
-      );
-
-      // Exponential backoff: wait before next retry
-      await delay(retryDelayMs);
-      retryDelayMs *= 2; // Double the delay for next retry
+      // Just retry - adaptive rate limiter will enforce appropriate delays
+      console.log(`Retry ${attempt}/${maxAttempts} for "${productName}"`);
     }
   }
 
@@ -668,6 +750,9 @@ function parseArgs(): CliOptions {
  * 5. Write results to CSV
  */
 async function main(): Promise<void> {
+  // Start timer
+  const startTime = Date.now();
+
   const { input: inputFile, output: outputFile, intervalMs, sessions } = parseArgs();
 
   if (Number.isNaN(intervalMs) || intervalMs < 0) {
@@ -741,10 +826,29 @@ async function main(): Promise<void> {
   await writeCsv(results, outputPath);
   console.log(`\n✓ Written ${results.length} rows to ${outputPath}`);
   console.log(`Session pool stats: ${sessionPool.getPoolSize()} session(s) created`);
+
+  // Show adaptive rate limiter stats
+  const rateLimiterStats = globalRateLimiter.getStats();
+  console.log(`\n⚡ Adaptive Rate Limiter:`);
+  console.log(`   Request delay: ${Math.round(rateLimiterStats.requestDelay / 1000)}s`);
+  console.log(`   Credential delay: ${Math.round(rateLimiterStats.credentialDelay / 1000)}s`);
+  console.log(`   Success rate: ${rateLimiterStats.successRate}`);
+
+  // Calculate elapsed time
+  const endTime = Date.now();
+  const elapsedMs = endTime - startTime;
+  const elapsedSeconds = Math.round(elapsedMs / 1000);
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = elapsedSeconds % 60;
+  const timeDisplay = minutes > 0
+    ? `${minutes}m ${seconds}s`
+    : `${seconds}s`;
+
   console.log(`\n📊 Summary:`);
   console.log(`   Total products: ${productNames.length}`);
   console.log(`   ✓ Successfully fetched: ${successCount}`);
   console.log(`   ✗ Failed (empty code): ${failedCount}`);
+  console.log(`   ⏱️  Total time: ${timeDisplay}`);
 }
 
 // Run main function
