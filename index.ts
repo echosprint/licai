@@ -51,7 +51,7 @@ interface ProductQueueItem {
   name: string;
   attemptCount: number;
   triedFullName: boolean; // Whether we've already tried full name search
-  success: true | false | null; // true = success, false = fail, null = pending
+  status: "success" | "fail" | "pending";
 }
 
 /**
@@ -327,12 +327,12 @@ async function fetchProduct(
 
   // Step 4: Return result
   if (!match) {
-    item.success = false;
+    item.status = "fail";
     console.log(`No exact match found for "${item.name}", returning empty code`);
     return { prodName: item.name, prodRegCode: "" };
   }
 
-  item.success = true;
+  item.status = "success";
   return {
     prodName: match.prodName,
     prodRegCode: match.prodRegCode ?? "",
@@ -385,7 +385,7 @@ async function performSearch(
     }
 
     // Both strategies failed - no retry needed
-    item.success = false;
+    item.status = "fail";
     console.log(
       `No products found for "${item.name}" (tried both full name and prefix)`
     );
@@ -418,7 +418,7 @@ function findProductMatch(results: Product[], item: ProductQueueItem): Product |
 
 /**
  * Process product queue with retry logic.
- * Processes items with success=null, retries on failure with exponential backoff.
+ * Processes items with status="pending", retries on failure with exponential backoff.
  *
  * @param queue - Array of product queue items
  * @param credentials - API credentials for authentication
@@ -430,8 +430,8 @@ async function processProductQueue(
   results: Map<string, ProductResult>
 ): Promise<void> {
   while (true) {
-    // Find first pending item (success = null)
-    const item = queue.find(item => item.success === null);
+    // Find first pending item
+    const item = queue.find(item => item.status === "pending");
 
     if (!item) {
       // No more pending items
@@ -441,7 +441,7 @@ async function processProductQueue(
     try {
       const result = await fetchProduct(item, credentials);
 
-      // fetchProduct already set success = true, just store result
+      // fetchProduct already set status to success, just store result
       results.set(item.name, result);
 
       const displayCode = result.prodRegCode || "(empty)";
@@ -451,7 +451,7 @@ async function processProductQueue(
       // fetchProduct already incremented attemptCount
       if (item.attemptCount >= TIMING_CONFIG.MAX_RETRY_ATTEMPTS) {
         // Max attempts reached - mark as failed
-        item.success = false;
+        item.status = "fail";
         results.set(item.name, { prodName: item.name, prodRegCode: "" });
         console.log(`✗ Failed for "${item.name}" after ${item.attemptCount} attempts`);
       } else {
@@ -459,7 +459,7 @@ async function processProductQueue(
         const backoffMs = 1000 * Math.pow(2, item.attemptCount - 1);
         console.log(`Retry ${item.attemptCount}/${TIMING_CONFIG.MAX_RETRY_ATTEMPTS} for "${item.name}" (waiting ${backoffMs / 1000}s)`);
         await delay(backoffMs);
-        // Item stays in queue with success=null for next iteration
+        // Item stays in queue with status="pending" for next iteration
       }
     }
   }
@@ -608,7 +608,7 @@ function initializeQueue(productNames: string[]): ProductQueueItem[] {
     name,
     attemptCount: 0,
     triedFullName: false,
-    success: null,
+    status: "pending",
   }));
 }
 
@@ -679,8 +679,8 @@ function printSummary(
   elapsedTime: string
 ): void {
   const { successCount, failedCount } = countResults(results);
-  const successItems = queue.filter(item => item.success === true).length;
-  const failedItems = queue.filter(item => item.success === false).length;
+  const successItems = queue.filter(item => item.status === "success").length;
+  const failedItems = queue.filter(item => item.status === "fail").length;
   const totalAttempts = queue.reduce((sum, item) => sum + item.attemptCount, 0);
 
   console.log(`\n📊 Summary:`);
