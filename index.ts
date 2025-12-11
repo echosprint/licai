@@ -51,6 +51,7 @@ interface CliOptions {
   input: string;
   output: string;
   intervalMs: number;
+  sessions: number;
 }
 
 /**
@@ -78,6 +79,14 @@ interface SearchRequest {
 interface ApiCredentials {
   publicKey: string | null;
   cookie: string | null;
+}
+
+/**
+ * Session slot with cached credentials and rate limiting
+ */
+interface Session {
+  credentials: ApiCredentials; // Cached credentials for this session
+  lastUsedAt: number; // timestamp in milliseconds
 }
 
 // ============================================================================
@@ -119,6 +128,75 @@ const HTTP_HEADERS = {
 } as const;
 
 // ============================================================================
+// Session Pool Management
+// ============================================================================
+
+/**
+ * Session pool manager for reusing API sessions with rate limiting.
+ * Maintains a pool of sessions, each with its own 8s cooldown period.
+ */
+class SessionPool {
+  private sessions: Session[] = [];
+  private maxSessions: number;
+  private intervalMs: number;
+
+  constructor(maxSessions: number, intervalMs: number) {
+    this.maxSessions = maxSessions;
+    this.intervalMs = intervalMs;
+  }
+
+  /**
+   * Get a session from the pool.
+   * - If pool < max: create new session slot with fresh credentials
+   * - If pool >= max: reuse oldest session (wait if needed for rate limit cooldown)
+   */
+  async getSession(): Promise<Session> {
+    const now = Date.now();
+
+    // If pool not full, create new session slot with credentials
+    if (this.sessions.length < this.maxSessions) {
+      console.log(`Creating new session slot (${this.sessions.length + 1}/${this.maxSessions})...`);
+
+      // Fetch credentials (rate limiting handled inside getApiCredentials)
+      const credentials = await getApiCredentials();
+
+      const session: Session = {
+        credentials,
+        lastUsedAt: Date.now(), // Mark as used immediately
+      };
+      this.sessions.push(session);
+      return session;
+    }
+
+    // Pool is full - find oldest session
+    const oldestSession = this.sessions.reduce((oldest, current) =>
+      current.lastUsedAt < oldest.lastUsedAt ? current : oldest
+    );
+
+    // Wait if necessary to respect rate limit cooldown
+    const timeSinceLastUse = now - oldestSession.lastUsedAt;
+    const waitTime = this.intervalMs - timeSinceLastUse;
+
+    if (waitTime > 0) {
+      console.log(`Waiting ${Math.round(waitTime / 1000)}s for session cooldown...`);
+      await delay(waitTime);
+    }
+
+    // Mark session as used when we allocate it
+    oldestSession.lastUsedAt = Date.now();
+
+    return oldestSession;
+  }
+
+  /**
+   * Get current pool size
+   */
+  getPoolSize(): number {
+    return this.sessions.length;
+  }
+}
+
+// ============================================================================
 // Utility Functions
 // ============================================================================
 
@@ -142,66 +220,33 @@ function normalizeForComparison(str: string): string {
 }
 
 /**
- * Calculate the longest common prefix length between two strings.
- * Used for similarity matching between product names.
- *
- * @param a - First string to compare
- * @param b - Second string to compare
- * @returns Length of the matching prefix
- */
-function longestCommonPrefixLength(a: string, b: string): number {
-  const normalizedA = normalizeForComparison(a);
-  const normalizedB = normalizeForComparison(b);
-
-  let i = 0;
-  const minLength = Math.min(normalizedA.length, normalizedB.length);
-
-  while (i < minLength && normalizedA[i] === normalizedB[i]) {
-    i++;
-  }
-
-  return i;
-}
-
-/**
- * Find the best matching product from multiple candidates using longest common prefix algorithm.
- * If multiple products have the same prefix length, prefer the shorter product name.
+ * Find exact matching product after normalization.
+ * Returns the product that exactly matches the search term after removing special characters.
  *
  * @param searchTerm - The original search term to match against
  * @param candidates - Array of products returned from API
- * @returns The product with the longest matching prefix (shorter names win ties)
+ * @returns The product that exactly matches, or null if no exact match found
  */
-function findBestMatch(searchTerm: string, candidates: Product[]): Product {
+function findExactMatch(searchTerm: string, candidates: Product[]): Product | null {
   if (candidates.length === 0) {
-    throw new Error("Cannot find best match from empty candidates array");
+    return null;
   }
 
-  const firstCandidate = candidates[0];
-  if (!firstCandidate) {
-    throw new Error("First candidate is undefined");
-  }
+  const normalizedSearch = normalizeForComparison(searchTerm);
 
-  let bestMatch = firstCandidate;
-  let bestScore = longestCommonPrefixLength(searchTerm, bestMatch.prodName);
-
-  for (let i = 1; i < candidates.length; i++) {
-    const candidate = candidates[i];
+  for (const candidate of candidates) {
     if (!candidate) continue;
 
-    const score = longestCommonPrefixLength(searchTerm, candidate.prodName);
+    const normalizedCandidate = normalizeForComparison(candidate.prodName);
 
-    // Use longest prefix, or shorter name as tie-breaker
-    if (
-      score > bestScore ||
-      (score === bestScore &&
-        candidate.prodName.length < bestMatch.prodName.length)
-    ) {
-      bestMatch = candidate;
-      bestScore = score;
+    // Exact match after normalization
+    if (normalizedSearch === normalizedCandidate) {
+      return candidate;
     }
   }
 
-  return bestMatch;
+  // No exact match found
+  return null;
 }
 
 // ============================================================================
@@ -209,12 +254,34 @@ function findBestMatch(searchTerm: string, candidates: Product[]): Product {
 // ============================================================================
 
 /**
+ * Track last credential fetch time to enforce rate limiting
+ */
+let lastCredentialFetchTime = 0;
+const CREDENTIAL_FETCH_COOLDOWN_MS = 2000; // 2s between credential requests
+
+/**
+ * Track last API request time for global rate limiting
+ */
+let lastApiRequestTime = 0;
+const GLOBAL_REQUEST_COOLDOWN_MS = 1000; // Minimum 1s between ANY requests
+
+/**
  * Get API credentials (RSA public key and session cookie) from the init endpoint.
  * The public key is used to sign subsequent requests.
+ * Includes automatic rate limiting to avoid overwhelming the server.
  *
  * @returns API credentials or null values if request fails
  */
 async function getApiCredentials(): Promise<ApiCredentials> {
+  // Rate limiting: wait if needed before fetching credentials
+  const now = Date.now();
+  const timeSinceLastFetch = now - lastCredentialFetchTime;
+  const waitTime = CREDENTIAL_FETCH_COOLDOWN_MS - timeSinceLastFetch;
+
+  if (lastCredentialFetchTime > 0 && waitTime > 0) {
+    console.log(`[Credentials] Waiting ${Math.round(waitTime / 1000)}s before fetching...`);
+    await delay(waitTime);
+  }
   const url = `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.INIT}`;
 
   try {
@@ -235,9 +302,16 @@ async function getApiCredentials(): Promise<ApiCredentials> {
       console.warn("Failed to parse init response:", error);
     }
 
+    // Record fetch time for rate limiting
+    lastCredentialFetchTime = Date.now();
+
     return { publicKey, cookie };
   } catch (error) {
     console.warn("Failed to get API credentials:", error);
+
+    // Record fetch time even on error
+    lastCredentialFetchTime = Date.now();
+
     return { publicKey: null, cookie: null };
   }
 }
@@ -273,13 +347,29 @@ function createSignature(
  * Search for products by name using the signed API.
  *
  * @param searchTerm - Product name to search for
- * @param credentials - API credentials (public key and cookie)
+ * @param sessionPool - Session pool for managing rate limiting and credentials
  * @returns Array of matching products (empty if none found)
  */
 async function searchProducts(
   searchTerm: string,
-  credentials: ApiCredentials
+  sessionPool: SessionPool
 ): Promise<Product[]> {
+  // Get session from pool (waits if necessary, marks as used immediately)
+  const session = await sessionPool.getSession();
+
+  // Global rate limiting: enforce minimum delay between ANY requests
+  const now = Date.now();
+  const timeSinceLastRequest = now - lastApiRequestTime;
+  const globalWaitTime = GLOBAL_REQUEST_COOLDOWN_MS - timeSinceLastRequest;
+
+  if (lastApiRequestTime > 0 && globalWaitTime > 0) {
+    console.log(`[Global] Waiting ${Math.round(globalWaitTime / 1000)}s between requests...`);
+    await delay(globalWaitTime);
+  }
+
+  // Use cached credentials from session
+  const credentials = session.credentials;
+
   const url = `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.SEARCH}`;
 
   const requestBody: SearchRequest = {
@@ -312,6 +402,9 @@ async function searchProducts(
     body: JSON.stringify(requestBody),
   });
 
+  // Record request time for global rate limiting
+  lastApiRequestTime = Date.now();
+
   if (!response.ok) {
     throw new Error(`Request failed: ${response.status} ${response.statusText}`);
   }
@@ -334,13 +427,16 @@ async function searchProducts(
  * 4. If still no results, return empty code
  *
  * @param productName - Product name to search for
+ * @param sessionPool - Session pool for managing rate limiting
  * @returns Product result (may have empty prodRegCode if not found)
  */
-async function fetchProduct(productName: string): Promise<ProductResult> {
-  const credentials = await getApiCredentials();
+async function fetchProduct(
+  productName: string,
+  sessionPool: SessionPool
+): Promise<ProductResult> {
 
   // Try searching with full product name
-  let results = await searchProducts(productName, credentials);
+  let results = await searchProducts(productName, sessionPool);
 
   // If no results, try with first N characters
   if (results.length === 0) {
@@ -349,8 +445,7 @@ async function fetchProduct(productName: string): Promise<ProductResult> {
       `No results for full name, trying first ${TIMING_CONFIG.PREFIX_LENGTH} chars: "${prefix}"`
     );
 
-    await delay(TIMING_CONFIG.FALLBACK_SEARCH_DELAY_MS);
-    results = await searchProducts(prefix, credentials);
+    results = await searchProducts(prefix, sessionPool);
 
     if (results.length === 0) {
       console.log(
@@ -360,12 +455,12 @@ async function fetchProduct(productName: string): Promise<ProductResult> {
     }
   }
 
-  // Select best match from results
-  const selected =
-    results.length === 1 ? results[0] : findBestMatch(productName, results);
+  // Find exact match from results
+  const selected = results.length === 1 ? results[0] : findExactMatch(productName, results);
 
   if (!selected) {
-    throw new Error("Selected product is undefined");
+    console.log(`No exact match found for "${productName}", returning empty code`);
+    return { prodName: productName, prodRegCode: "" };
   }
 
   return {
@@ -379,36 +474,35 @@ async function fetchProduct(productName: string): Promise<ProductResult> {
  * Helps handle transient errors and rate limits.
  *
  * @param productName - Product name to search for
+ * @param sessionPool - Session pool for managing rate limiting
  * @param maxAttempts - Maximum number of retry attempts
- * @param initialWaitMs - Initial wait time before first retry
  * @returns Product result
  * @throws Error if all retry attempts fail
  */
 async function fetchProductWithRetry(
   productName: string,
-  maxAttempts = TIMING_CONFIG.MAX_RETRY_ATTEMPTS,
-  initialWaitMs = TIMING_CONFIG.INITIAL_RETRY_WAIT_MS
+  sessionPool: SessionPool,
+  maxAttempts = TIMING_CONFIG.MAX_RETRY_ATTEMPTS
 ): Promise<ProductResult> {
   let attempt = 0;
-  let waitMs = initialWaitMs;
+  let retryDelayMs = 1000; // Start with 1 second
 
   while (attempt < maxAttempts) {
     attempt++;
     try {
-      return await fetchProduct(productName);
+      return await fetchProduct(productName, sessionPool);
     } catch (error) {
       if (attempt >= maxAttempts) {
         throw error;
       }
 
       console.log(
-        `Retry ${attempt}/${maxAttempts} for "${productName}" after ${Math.round(
-          waitMs / 1000
-        )}s`
+        `Retry ${attempt}/${maxAttempts} for "${productName}" after ${retryDelayMs / 1000}s`
       );
 
-      await delay(waitMs);
-      waitMs *= 2; // Exponential backoff
+      // Exponential backoff: wait before next retry
+      await delay(retryDelayMs);
+      retryDelayMs *= 2; // Double the delay for next retry
     }
   }
 
@@ -467,8 +561,8 @@ async function writeCsv(
  * Supports both named flags and positional arguments.
  *
  * Examples:
- * - bun index.ts --input products.txt --output results.csv --interval 8
- * - bun index.ts products.txt results.csv 8
+ * - bun index.ts --input products.txt --output results.csv --interval 8 --sessions 4
+ * - bun index.ts products.txt results.csv 8 4
  *
  * @returns Parsed CLI options
  */
@@ -478,11 +572,13 @@ function parseArgs(): CliOptions {
       input: "i",
       output: "o",
       interval: "t", // seconds
+      sessions: "s",
     },
-    string: ["input", "output", "interval"],
+    string: ["input", "output", "interval", "sessions"],
     default: {
       input: "products.txt",
       output: "results.csv",
+      sessions: "1",
     },
   });
 
@@ -501,10 +597,16 @@ function parseArgs(): CliOptions {
       ? intervalSeconds * 1000
       : TIMING_CONFIG.DEFAULT_INTERVAL_MS;
 
+  const sessionsCandidate =
+    argv.sessions ?? (positional[3] !== undefined ? positional[3] : "1");
+  const sessions = Number(sessionsCandidate);
+  const sessionsCount = Number.isFinite(sessions) && sessions >= 1 ? sessions : 1;
+
   return {
     input,
     output,
     intervalMs,
+    sessions: sessionsCount,
   };
 }
 
@@ -516,14 +618,20 @@ function parseArgs(): CliOptions {
  * Main execution flow:
  * 1. Parse command line arguments
  * 2. Read product names from input file
- * 3. Fetch each product with retries and pacing
- * 4. Write results to CSV
+ * 3. Create session pool with max sessions
+ * 4. Fetch all products concurrently using session pool
+ * 5. Write results to CSV
  */
 async function main(): Promise<void> {
-  const { input: inputFile, output: outputFile, intervalMs } = parseArgs();
+  const { input: inputFile, output: outputFile, intervalMs, sessions } = parseArgs();
 
   if (Number.isNaN(intervalMs) || intervalMs < 0) {
     console.error("Invalid interval (ms).");
+    process.exit(1);
+  }
+
+  if (Number.isNaN(sessions) || sessions < 1) {
+    console.error("Invalid sessions count (must be >= 1).");
     process.exit(1);
   }
 
@@ -535,7 +643,7 @@ async function main(): Promise<void> {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       console.error(`Input file not found: ${inputFile}`);
       console.error(
-        "Usage: bun index.ts [--input products.txt] [--output results.csv] [--interval seconds]"
+        "Usage: bun index.ts [--input products.txt] [--output results.csv] [--interval seconds] [--sessions count]"
       );
       process.exit(1);
     }
@@ -547,35 +655,51 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  console.log(`Processing ${productNames.length} products...`);
+  console.log(`Processing ${productNames.length} products with ${sessions} concurrent session(s)...`);
+  console.log(`Each session has ${intervalMs / 1000}s cooldown between requests.\n`);
 
-  // Fetch each product with retries and pacing
+  // Create session pool
+  const sessionPool = new SessionPool(sessions, intervalMs);
+
+  // Fetch products sequentially (one by one)
+  // SessionPool controls timing - with N sessions, we'll use them in rotation
   const results: ProductResult[] = [];
+  let successCount = 0;
+  let failedCount = 0;
 
-  for (let i = 0; i < productNames.length; i++) {
-    const productName = productNames[i];
-    if (!productName) continue;
-
+  for (const productName of productNames) {
     try {
-      const result = await fetchProductWithRetry(productName);
-      results.push(result);
+      // Fetch product (sessionPool handles rate limiting internally)
+      const result = await fetchProductWithRetry(productName, sessionPool);
 
       const displayCode = result.prodRegCode || "(empty)";
-      console.log(`${result.prodName},${displayCode}`);
-    } catch (error) {
-      console.log(`Failed for "${productName}" after retries: ${error}`);
-    }
+      console.log(`✓ ${result.prodName},${displayCode}`);
 
-    // Wait between products (except after last one)
-    if (i < productNames.length - 1) {
-      await delay(intervalMs);
+      results.push(result);
+
+      // Count as success if we got a registration code
+      if (result.prodRegCode) {
+        successCount++;
+      } else {
+        failedCount++;
+      }
+    } catch (error) {
+      console.log(`✗ Failed for "${productName}" after retries: ${error}`);
+      // Still add product with empty code if it failed completely
+      results.push({ prodName: productName, prodRegCode: "" });
+      failedCount++;
     }
   }
 
   // Write results to CSV
   const outputPath = path.resolve(outputFile);
   await writeCsv(results, outputPath);
-  console.log(`\nWritten ${results.length} rows to ${outputPath}`);
+  console.log(`\n✓ Written ${results.length} rows to ${outputPath}`);
+  console.log(`Session pool stats: ${sessionPool.getPoolSize()} session(s) created`);
+  console.log(`\n📊 Summary:`);
+  console.log(`   Total products: ${productNames.length}`);
+  console.log(`   ✓ Successfully fetched: ${successCount}`);
+  console.log(`   ✗ Failed (empty code): ${failedCount}`);
 }
 
 // Run main function
