@@ -806,18 +806,12 @@ function printSummary(
   elapsedTime: string
 ): void {
   const { successCount, failedCount } = countResults(results);
-  const successItems = queue.filter(item => item.status === "success").length;
-  const failedItems = queue.filter(item => item.status === "fail").length;
   const totalAttempts = queue.reduce((sum, item) => sum + item.attemptCount, 0);
 
   console.log(`\n📊 Summary:`);
   console.log(`   Total products: ${productNames.length}`);
   console.log(`   ${COLORS.GREEN}✓${COLORS.RESET} Successfully fetched: ${successCount}`);
   console.log(`   ${COLORS.RED}✗${COLORS.RESET} Failed (empty code): ${failedCount}`);
-
-  console.log(`\n📋 Queue Statistics:`);
-  console.log(`   Success: ${successItems}`);
-  console.log(`   Failed: ${failedItems}`);
   console.log(`   Total attempts: ${totalAttempts}`);
   console.log(`   ⏱️  Total time: ${elapsedTime}`);
 }
