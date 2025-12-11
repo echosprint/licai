@@ -16,6 +16,26 @@ interface Product {
 }
 
 /**
+ * Custom error for API-related failures
+ */
+class ApiError extends Error {
+  constructor(message: string, public readonly statusCode?: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+/**
+ * Custom error for search-related failures (triggers retry)
+ */
+class SearchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SearchError";
+  }
+}
+
+/**
  * Response from the initialization endpoint containing RSA public key
  */
 interface ApiInitResponse {
@@ -155,12 +175,40 @@ async function delay(ms: number): Promise<void> {
 /**
  * Log message only if verbose mode is enabled
  * Messages are displayed in gray color to distinguish from normal output
- * @param message - Message to log
+ * @param args - Messages to log
  */
-function logVerbose(...args: any[]): void {
+function logVerbose(...args: (string | number | boolean)[]): void {
   if (VERBOSE) {
     console.log(`${COLORS.GRAY}%s${COLORS.RESET}`, args.join(" "));
   }
+}
+
+/**
+ * Format progress counter with padding for vertical alignment.
+ *
+ * @param completed - Number of completed items
+ * @param total - Total number of items
+ * @returns Formatted progress string like "[  3/100]"
+ */
+function formatProgress(completed: number, total: number): string {
+  const padding = String(total).length;
+  return `[${String(completed).padStart(padding, " ")}/${total}]`;
+}
+
+/**
+ * Log a product result with progress counter and color-coded status.
+ *
+ * @param completed - Number of completed items
+ * @param total - Total number of items
+ * @param result - Product result to log
+ */
+function logProductResult(completed: number, total: number, result: ProductResult): void {
+  const displayCode = result.prodRegCode || "(empty)";
+  const icon = result.prodRegCode
+    ? `${COLORS.GREEN}✓${COLORS.RESET}`
+    : `${COLORS.RED}✗${COLORS.RESET}`;
+  const progress = formatProgress(completed, total);
+  console.log(`${progress} ${icon} ${result.prodName},${displayCode}`);
 }
 
 /**
@@ -313,7 +361,10 @@ async function searchProducts(
   });
 
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status} ${response.statusText}`);
+    throw new ApiError(
+      `Request failed: ${response.status} ${response.statusText}`,
+      response.status
+    );
   }
 
   const json = (await response.json()) as ProductListResponse;
@@ -408,7 +459,7 @@ async function performSearch(
       // Mark full name as tried and trigger retry with prefix
       item.triedFullName = true;
       logVerbose(`No results for full name "${item.name}", will retry with prefix`);
-      throw new Error("Empty results for full name search");
+      throw new SearchError("Empty results for full name search");
     }
 
     // Both strategies failed - no retry needed
@@ -457,6 +508,7 @@ async function processProductQueue(
   results: Map<string, ProductResult>
 ): Promise<void> {
   const total = queue.length;
+  let completed = 0;
 
   while (true) {
     // Find first pending item
@@ -472,27 +524,19 @@ async function processProductQueue(
 
       // fetchProduct already set status to success, just store result
       results.set(item.name, result);
-
-      // Calculate progress: count completed items (success or fail)
-      const completed = queue.filter(item => item.status !== "pending").length;
-      const displayCode = result.prodRegCode || "(empty)";
-      const icon = result.prodRegCode
-        ? `${COLORS.GREEN}✓${COLORS.RESET}`
-        : `${COLORS.RED}✗${COLORS.RESET}`;
-      const padding = String(total).length;
-      const progress = `[${String(completed).padStart(padding, " ")}/${total}]`;
-      console.log(`${progress} ${icon} ${result.prodName},${displayCode}`);
+      completed++;
+      logProductResult(completed, total, result);
 
     } catch (error) {
       // fetchProduct already incremented attemptCount
       if (item.attemptCount >= TIMING_CONFIG.MAX_RETRY_ATTEMPTS) {
         // Max attempts reached - mark as failed
         item.status = "fail";
-        results.set(item.name, { prodName: item.name, prodRegCode: "" });
-        const completed = queue.filter(item => item.status !== "pending").length;
-        const padding = String(total).length;
-        const progress = `[${String(completed).padStart(padding, " ")}/${total}]`;
-        console.log(`${progress} ${COLORS.RED}✗${COLORS.RESET} Failed for "${item.name}" after ${item.attemptCount} attempts`);
+        const failedResult: ProductResult = { prodName: item.name, prodRegCode: "" };
+        results.set(item.name, failedResult);
+        completed++;
+        logVerbose(`Failed for "${item.name}" after ${item.attemptCount} attempts`);
+        logProductResult(completed, total, failedResult);
       } else {
         // Retry with exponential backoff
         const backoffMs = 1000 * Math.pow(2, item.attemptCount - 1);
@@ -509,11 +553,33 @@ async function processProductQueue(
 // ============================================================================
 
 /**
+ * Validate product name meets basic requirements.
+ *
+ * @param name - Product name to validate
+ * @returns True if valid, false otherwise
+ */
+function isValidProductName(name: string): boolean {
+  // Must be non-empty after trimming
+  if (!name || name.trim().length === 0) {
+    return false;
+  }
+
+  // Must not be too long (reasonable limit)
+  if (name.length > 200) {
+    return false;
+  }
+
+  // Must contain at least one non-whitespace character
+  return /\S/.test(name);
+}
+
+/**
  * Read and parse product names from input file.
  * Cleans up lines by:
  * - Trimming whitespace
  * - Removing quotes (English & Chinese)
  * - Removing all spaces
+ * - Filtering invalid names
  *
  * @param filePath - Path to input file
  * @returns Array of cleaned product names
@@ -527,7 +593,21 @@ async function readLines(filePath: string): Promise<string[]> {
     .map((line) => line.replace(/^["'"']|["'"']$/g, "")) // Remove quotes
     .map((line) => line.trim())
     .map((line) => line.replace(/\s+/g, "")) // Remove all spaces
-    .filter((line) => line.length > 0);
+    .filter((line) => line.length > 0 && isValidProductName(line));
+}
+
+/**
+ * Escape CSV field value if it contains special characters.
+ * Wraps field in quotes and escapes internal quotes.
+ *
+ * @param value - Field value to escape
+ * @returns Escaped CSV field
+ */
+function escapeCsvField(value: string): string {
+  if (value.includes(",") || value.includes('"') || value.includes("\n")) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
 }
 
 /**
@@ -541,7 +621,9 @@ async function writeCsv(
   outputPath: string
 ): Promise<void> {
   const header = "prodName,prodRegCode";
-  const lines = rows.map((row) => `${row.prodName},${row.prodRegCode}`);
+  const lines = rows.map((row) =>
+    `${escapeCsvField(row.prodName)},${escapeCsvField(row.prodRegCode)}`
+  );
   const csv = [header, ...lines].join("\n");
 
   await fs.writeFile(outputPath, csv, "utf8");
