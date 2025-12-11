@@ -716,8 +716,9 @@ async function writeCsv(
  * Supports both named flags and positional arguments.
  *
  * Examples:
- * - bun index.ts --input products.txt --output results.csv --interval 8 --sessions 4
- * - bun index.ts products.txt results.csv 8 4
+ * - bun index.ts --sessions 4 (recommended - adaptive timing handles interval)
+ * - bun index.ts --input products.txt --output results.csv --sessions 4
+ * - bun index.ts products.txt results.csv 8 4 (legacy format with interval)
  *
  * @returns Parsed CLI options
  */
@@ -733,7 +734,7 @@ function parseArgs(): CliOptions {
     default: {
       input: "products.txt",
       output: "results.csv",
-      sessions: "1",
+      sessions: "4", // Default to 4 concurrent sessions for optimal performance
     },
   });
 
@@ -783,11 +784,7 @@ async function main(): Promise<void> {
 
   const { input: inputFile, output: outputFile, intervalMs, sessions } = parseArgs();
 
-  if (Number.isNaN(intervalMs) || intervalMs < 0) {
-    console.error("Invalid interval (ms).");
-    process.exit(1);
-  }
-
+  // Session count validation only (interval is optional with adaptive timing)
   if (Number.isNaN(sessions) || sessions < 1) {
     console.error("Invalid sessions count (must be >= 1).");
     process.exit(1);
@@ -801,8 +798,9 @@ async function main(): Promise<void> {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       console.error(`Input file not found: ${inputFile}`);
       console.error(
-        "Usage: bun index.ts [--input products.txt] [--output results.csv] [--interval seconds] [--sessions count]"
+        "Usage: bun index.ts [--input products.txt] [--output results.csv] [--sessions count] [--interval seconds]"
       );
+      console.error("Note: --interval is optional (adaptive timing adjusts automatically)");
       process.exit(1);
     }
     throw error;
@@ -814,7 +812,8 @@ async function main(): Promise<void> {
   }
 
   console.log(`Processing ${productNames.length} products with ${sessions} concurrent session(s)...`);
-  console.log(`Each session has ${intervalMs / 1000}s cooldown between requests.\n`);
+  console.log(`Session cooldown: ${intervalMs / 1000}s (backup safety limit)`);
+  console.log(`Adaptive rate limiter will optimize request timing automatically.\n`);
 
   // Create session pool
   const sessionPool = new SessionPool(sessions, intervalMs);
