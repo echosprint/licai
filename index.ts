@@ -60,6 +60,7 @@ interface ProductQueueItem {
 interface CliOptions {
   input: string;
   output: string;
+  verbose: boolean;
 }
 
 /**
@@ -124,6 +125,20 @@ const HTTP_HEADERS = {
   Referer: API_CONFIG.BASE_URL,
 } as const;
 
+/**
+ * Global verbose flag for controlling log output
+ */
+let VERBOSE = false;
+
+/**
+ * ANSI color codes for terminal output
+ */
+const COLORS = {
+  GREEN: "\x1b[32m",
+  RED: "\x1b[31m",
+  RESET: "\x1b[0m",
+} as const;
+
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -134,6 +149,16 @@ const HTTP_HEADERS = {
  */
 async function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Log message only if verbose mode is enabled
+ * @param message - Message to log
+ */
+function logVerbose(...args: any[]): void {
+  if (VERBOSE) {
+    console.log(...args);
+  }
 }
 
 /**
@@ -328,7 +353,7 @@ async function fetchProduct(
   // Step 4: Return result
   if (!match) {
     item.status = "fail";
-    console.log(`No exact match found for "${item.name}", returning empty code`);
+    logVerbose(`No exact match found for "${item.name}", returning empty code`);
     return { prodName: item.name, prodRegCode: "" };
   }
 
@@ -353,7 +378,7 @@ function determineSearchTerm(item: ProductQueueItem): string {
 
   // Fallback: use prefix
   const prefix = item.name.slice(0, TIMING_CONFIG.FALLBACK_SEARCH_PREFIX_LENGTH);
-  console.log(
+  logVerbose(
     `Trying prefix search (first ${TIMING_CONFIG.FALLBACK_SEARCH_PREFIX_LENGTH} chars): "${prefix}"`
   );
   return prefix;
@@ -380,13 +405,13 @@ async function performSearch(
     if (!item.triedFullName) {
       // Mark full name as tried and trigger retry with prefix
       item.triedFullName = true;
-      console.log(`No results for full name "${item.name}", will retry with prefix`);
+      logVerbose(`No results for full name "${item.name}", will retry with prefix`);
       throw new Error("Empty results for full name search");
     }
 
     // Both strategies failed - no retry needed
     item.status = "fail";
-    console.log(
+    logVerbose(
       `No products found for "${item.name}" (tried both full name and prefix)`
     );
   }
@@ -410,7 +435,7 @@ function findProductMatch(results: Product[], item: ProductQueueItem): Product |
   // Always use exact match, even for single results
   const exactMatch = findExactMatch(item.name, results);
   if (!exactMatch) {
-    console.log(`No exact match found for "${item.name}"`);
+    logVerbose(`No exact match found for "${item.name}"`);
   }
 
   return exactMatch;
@@ -429,6 +454,8 @@ async function processProductQueue(
   credentials: ApiCredentials,
   results: Map<string, ProductResult>
 ): Promise<void> {
+  const total = queue.length;
+
   while (true) {
     // Find first pending item
     const item = queue.find(item => item.status === "pending");
@@ -444,8 +471,15 @@ async function processProductQueue(
       // fetchProduct already set status to success, just store result
       results.set(item.name, result);
 
+      // Calculate progress: count completed items (success or fail)
+      const completed = queue.filter(item => item.status !== "pending").length;
       const displayCode = result.prodRegCode || "(empty)";
-      console.log(`✓ ${result.prodName},${displayCode}`);
+      const icon = result.prodRegCode
+        ? `${COLORS.GREEN}✓${COLORS.RESET}`
+        : `${COLORS.RED}✗${COLORS.RESET}`;
+      const padding = String(total).length;
+      const progress = `[${String(completed).padStart(padding, " ")}/${total}]`;
+      console.log(`${progress} ${icon} ${result.prodName},${displayCode}`);
 
     } catch (error) {
       // fetchProduct already incremented attemptCount
@@ -453,11 +487,14 @@ async function processProductQueue(
         // Max attempts reached - mark as failed
         item.status = "fail";
         results.set(item.name, { prodName: item.name, prodRegCode: "" });
-        console.log(`✗ Failed for "${item.name}" after ${item.attemptCount} attempts`);
+        const completed = queue.filter(item => item.status !== "pending").length;
+        const padding = String(total).length;
+        const progress = `[${String(completed).padStart(padding, " ")}/${total}]`;
+        console.log(`${progress} ${COLORS.RED}✗${COLORS.RESET} Failed for "${item.name}" after ${item.attemptCount} attempts`);
       } else {
         // Retry with exponential backoff
         const backoffMs = 1000 * Math.pow(2, item.attemptCount - 1);
-        console.log(`Retry ${item.attemptCount}/${TIMING_CONFIG.MAX_RETRY_ATTEMPTS} for "${item.name}" (waiting ${backoffMs / 1000}s)`);
+        logVerbose(`Retry ${item.attemptCount}/${TIMING_CONFIG.MAX_RETRY_ATTEMPTS} for "${item.name}" (waiting ${backoffMs / 1000}s)`);
         await delay(backoffMs);
         // Item stays in queue with status="pending" for next iteration
       }
@@ -519,6 +556,7 @@ async function writeCsv(
  * Examples:
  * - bun index.ts (uses defaults: products.txt, results.csv)
  * - bun index.ts --input products.txt --output results.csv
+ * - bun index.ts --verbose (enables detailed logging)
  *
  * @returns Parsed CLI options
  */
@@ -527,11 +565,14 @@ function parseArgs(): CliOptions {
     alias: {
       input: "i",
       output: "o",
+      verbose: "v",
     },
     string: ["input", "output"],
+    boolean: ["verbose"],
     default: {
       input: "products.txt",
       output: "results.csv",
+      verbose: false,
     },
   });
 
@@ -541,10 +582,12 @@ function parseArgs(): CliOptions {
     (positional[0] ? String(positional[0]) : argv.input) ?? "products.txt";
   const output =
     (positional[1] ? String(positional[1]) : argv.output) ?? "results.csv";
+  const verbose = argv.verbose ?? false;
 
   return {
     input,
     output,
+    verbose,
   };
 }
 
@@ -586,7 +629,7 @@ async function loadProductNames(filePath: string): Promise<string[]> {
  * @returns Validated API credentials
  */
 async function fetchCredentials(): Promise<ApiCredentials> {
-  console.log("Fetching API credentials...");
+  logVerbose("Fetching API credentials...");
   const credentials = await getApiCredentials();
 
   if (!credentials.publicKey || !credentials.cookie) {
@@ -705,11 +748,14 @@ function printSummary(
  */
 async function main(): Promise<void> {
   const startTime = Date.now();
-  const { input: inputFile, output: outputFile } = parseArgs();
+  const { input: inputFile, output: outputFile, verbose } = parseArgs();
+
+  // Set global verbose flag
+  VERBOSE = verbose;
 
   // Step 1: Load and validate input
   const productNames = await loadProductNames(inputFile);
-  console.log(`Processing ${productNames.length} products with queue-based retry logic...\n`);
+  logVerbose(`Processing ${productNames.length} products with queue-based retry logic...\n`);
 
   // Step 2: Fetch API credentials
   const credentials = await fetchCredentials();
@@ -723,7 +769,7 @@ async function main(): Promise<void> {
   const results = orderResults(productNames, resultsMap);
   const outputPath = path.resolve(outputFile);
   await writeCsv(results, outputPath);
-  console.log(`\n✓ Written ${results.length} rows to ${outputPath}`);
+  logVerbose(`\n✓ Written ${results.length} rows to ${outputPath}`);
 
   // Step 5: Print execution summary
   const elapsedTime = formatElapsedTime(startTime);
