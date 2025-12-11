@@ -812,8 +812,8 @@ function printSummary(
 
   console.log(`\n📊 Summary:`);
   console.log(`   Total products: ${productNames.length}`);
-  console.log(`   ✓ Successfully fetched: ${successCount}`);
-  console.log(`   ✗ Failed (empty code): ${failedCount}`);
+  console.log(`   ${COLORS.GREEN}✓${COLORS.RESET} Successfully fetched: ${successCount}`);
+  console.log(`   ${COLORS.RED}✗${COLORS.RESET} Failed (empty code): ${failedCount}`);
 
   console.log(`\n📋 Queue Statistics:`);
   console.log(`   Success: ${successItems}`);
