@@ -553,27 +553,24 @@ function parseArgs(): CliOptions {
 // ============================================================================
 
 /**
- * Main execution flow:
- * 1. Parse command line arguments
- * 2. Read product names from input file
- * 3. Fetch API credentials once
- * 4. Initialize product queue with all items
- * 5. Process queue with smart retry logic (exponential backoff, stateful retries)
- * 6. Write results to CSV
+ * Load and validate product names from input file.
+ *
+ * @param filePath - Path to input file
+ * @returns Array of product names
  */
-async function main(): Promise<void> {
-  // Start timer
-  const startTime = Date.now();
-
-  const { input: inputFile, output: outputFile } = parseArgs();
-
-  // Read product names from input file
-  let productNames: string[];
+async function loadProductNames(filePath: string): Promise<string[]> {
   try {
-    productNames = await readLines(inputFile);
+    const productNames = await readLines(filePath);
+
+    if (productNames.length === 0) {
+      console.error("Input file is empty.");
+      process.exit(1);
+    }
+
+    return productNames;
   } catch (error: unknown) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-      console.error(`Input file not found: ${inputFile}`);
+      console.error(`Input file not found: ${filePath}`);
       console.error(
         "Usage: bun index.ts [--input products.txt] [--output results.csv]"
       );
@@ -581,15 +578,14 @@ async function main(): Promise<void> {
     }
     throw error;
   }
+}
 
-  if (productNames.length === 0) {
-    console.error("Input file is empty.");
-    process.exit(1);
-  }
-
-  console.log(`Processing ${productNames.length} products with queue-based retry logic...\n`);
-
-  // Get API credentials once for all requests
+/**
+ * Fetch and validate API credentials.
+ *
+ * @returns Validated API credentials
+ */
+async function fetchCredentials(): Promise<ApiCredentials> {
   console.log("Fetching API credentials...");
   const credentials = await getApiCredentials();
 
@@ -598,26 +594,50 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Initialize product queue
-  const queue: ProductQueueItem[] = productNames.map(name => ({
+  return credentials;
+}
+
+/**
+ * Initialize product queue with all items in pending state.
+ *
+ * @param productNames - Array of product names to process
+ * @returns Initialized queue
+ */
+function initializeQueue(productNames: string[]): ProductQueueItem[] {
+  return productNames.map(name => ({
     name,
     attemptCount: 0,
     triedFullName: false,
     success: null,
   }));
+}
 
-  // Process queue with retry logic
-  const resultsMap = new Map<string, ProductResult>();
-  await processProductQueue(queue, credentials, resultsMap);
-
-  // Convert map to array preserving original order
-  const results: ProductResult[] = productNames.map(name =>
+/**
+ * Convert results map to ordered array matching input order.
+ *
+ * @param productNames - Original product names in order
+ * @param resultsMap - Map of product name to result
+ * @returns Ordered array of results
+ */
+function orderResults(
+  productNames: string[],
+  resultsMap: Map<string, ProductResult>
+): ProductResult[] {
+  return productNames.map(name =>
     resultsMap.get(name) || { prodName: name, prodRegCode: "" }
   );
+}
 
-  // Count successes and failures
+/**
+ * Count successful and failed results.
+ *
+ * @param results - Array of product results
+ * @returns Object with success and failure counts
+ */
+function countResults(results: ProductResult[]): { successCount: number; failedCount: number } {
   let successCount = 0;
   let failedCount = 0;
+
   for (const result of results) {
     if (result.prodRegCode) {
       successCount++;
@@ -626,34 +646,88 @@ async function main(): Promise<void> {
     }
   }
 
-  // Write results to CSV
-  const outputPath = path.resolve(outputFile);
-  await writeCsv(results, outputPath);
-  console.log(`\n✓ Written ${results.length} rows to ${outputPath}`);
+  return { successCount, failedCount };
+}
 
-  // Calculate elapsed time
-  const endTime = Date.now();
-  const elapsedMs = endTime - startTime;
+/**
+ * Format elapsed time in human-readable format.
+ *
+ * @param startTime - Start timestamp in milliseconds
+ * @returns Formatted time string (e.g., "2m 30s" or "45s")
+ */
+function formatElapsedTime(startTime: number): string {
+  const elapsedMs = Date.now() - startTime;
   const elapsedSeconds = Math.round(elapsedMs / 1000);
   const minutes = Math.floor(elapsedSeconds / 60);
   const seconds = elapsedSeconds % 60;
-  const timeDisplay = minutes > 0
-    ? `${minutes}m ${seconds}s`
-    : `${seconds}s`;
+
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+/**
+ * Print execution summary with statistics.
+ *
+ * @param productNames - Original product names
+ * @param results - Final results array
+ * @param queue - Processed queue with statistics
+ * @param elapsedTime - Formatted elapsed time string
+ */
+function printSummary(
+  productNames: string[],
+  results: ProductResult[],
+  queue: ProductQueueItem[],
+  elapsedTime: string
+): void {
+  const { successCount, failedCount } = countResults(results);
+  const successItems = queue.filter(item => item.success === true).length;
+  const failedItems = queue.filter(item => item.success === false).length;
+  const totalAttempts = queue.reduce((sum, item) => sum + item.attemptCount, 0);
 
   console.log(`\n📊 Summary:`);
   console.log(`   Total products: ${productNames.length}`);
   console.log(`   ✓ Successfully fetched: ${successCount}`);
   console.log(`   ✗ Failed (empty code): ${failedCount}`);
 
-  // Show queue statistics
-  const successItems = queue.filter(item => item.success === true).length;
-  const failedItems = queue.filter(item => item.success === false).length;
   console.log(`\n📋 Queue Statistics:`);
   console.log(`   Success: ${successItems}`);
   console.log(`   Failed: ${failedItems}`);
-  console.log(`   Total attempts: ${queue.reduce((sum, item) => sum + item.attemptCount, 0)}`);
-  console.log(`   ⏱️  Total time: ${timeDisplay}`);
+  console.log(`   Total attempts: ${totalAttempts}`);
+  console.log(`   ⏱️  Total time: ${elapsedTime}`);
+}
+
+/**
+ * Main execution flow:
+ * 1. Parse arguments and load input
+ * 2. Fetch API credentials
+ * 3. Initialize and process queue
+ * 4. Write results to CSV
+ * 5. Print summary
+ */
+async function main(): Promise<void> {
+  const startTime = Date.now();
+  const { input: inputFile, output: outputFile } = parseArgs();
+
+  // Step 1: Load and validate input
+  const productNames = await loadProductNames(inputFile);
+  console.log(`Processing ${productNames.length} products with queue-based retry logic...\n`);
+
+  // Step 2: Fetch API credentials
+  const credentials = await fetchCredentials();
+
+  // Step 3: Initialize and process queue
+  const queue = initializeQueue(productNames);
+  const resultsMap = new Map<string, ProductResult>();
+  await processProductQueue(queue, credentials, resultsMap);
+
+  // Step 4: Order results and write to CSV
+  const results = orderResults(productNames, resultsMap);
+  const outputPath = path.resolve(outputFile);
+  await writeCsv(results, outputPath);
+  console.log(`\n✓ Written ${results.length} rows to ${outputPath}`);
+
+  // Step 5: Print execution summary
+  const elapsedTime = formatElapsedTime(startTime);
+  printSummary(productNames, results, queue, elapsedTime);
 }
 
 // Run main function
