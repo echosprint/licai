@@ -132,45 +132,43 @@ const HTTP_HEADERS = {
 // ============================================================================
 
 /**
- * Session pool manager for reusing API sessions with rate limiting.
+ * Session pool manager for reusing API sessions.
  *
  * How it works:
  * - Maintains a pool of sessions, each with cached API credentials
- * - Each session has its own cooldown period (e.g., 8s between uses)
- * - When all sessions are busy, waits for the oldest one to become available
- * - This allows N concurrent requests while respecting per-session rate limits
+ * - Creates new sessions up to maxSessions, then rotates through them
+ * - Rate limiting is handled by AdaptiveRateLimiter, not by session pool
  *
- * Example with 4 sessions and 8s cooldown:
+ * Example with 4 sessions:
  *   Request 1-4: Use sessions 1-4 immediately (no wait)
- *   Request 5: Wait for session 1 to cool down (~8s)
- *   Request 6: Wait for session 2 to cool down (minimal wait)
+ *   Request 5+: Rotate through existing sessions (adaptive timing controls delays)
  */
 class SessionPool {
   private sessions: Session[] = [];
   private readonly maxSessions: number;
-  private readonly cooldownIntervalMs: number;
+  private currentIndex = 0;
 
-  constructor(maxSessions: number, cooldownIntervalMs: number) {
+  constructor(maxSessions: number) {
     this.maxSessions = maxSessions;
-    this.cooldownIntervalMs = cooldownIntervalMs;
   }
 
   /**
    * Get an available session from the pool.
-   * Creates new sessions up to maxSessions, then reuses oldest available session.
+   * Creates new sessions up to maxSessions, then rotates through them.
+   * Rate limiting is handled by AdaptiveRateLimiter.
    *
    * @returns Session with credentials ready to use
    */
   async getSession(): Promise<Session> {
-    const now = Date.now();
-
     // Create new session if pool not yet full
     if (this.sessions.length < this.maxSessions) {
       return await this.createNewSession();
     }
 
-    // Pool is full - find and wait for oldest session
-    return await this.reuseOldestSession(now);
+    // Pool is full - rotate through sessions in round-robin fashion
+    const session = this.sessions[this.currentIndex]!;
+    this.currentIndex = (this.currentIndex + 1) % this.maxSessions;
+    return session;
   }
 
   /**
@@ -185,36 +183,11 @@ class SessionPool {
 
     const session: Session = {
       credentials,
-      lastUsedAt: Date.now(), // Mark as used immediately to prevent race conditions
+      lastUsedAt: Date.now(), // Keep for potential future use
     };
 
     this.sessions.push(session);
     return session;
-  }
-
-  /**
-   * Reuse the oldest session after waiting for its cooldown if needed
-   */
-  private async reuseOldestSession(currentTime: number): Promise<Session> {
-    // Find session that was used longest ago
-    const oldestSession = this.sessions.reduce((oldest, current) =>
-      current.lastUsedAt < oldest.lastUsedAt ? current : oldest
-    );
-
-    // Calculate if we need to wait for cooldown
-    const timeSinceLastUse = currentTime - oldestSession.lastUsedAt;
-    const remainingCooldown = this.cooldownIntervalMs - timeSinceLastUse;
-
-    if (remainingCooldown > 0) {
-      const waitSeconds = Math.round(remainingCooldown / 1000);
-      console.log(`Waiting ${waitSeconds}s for session cooldown...`);
-      await delay(remainingCooldown);
-    }
-
-    // Mark session as used now
-    oldestSession.lastUsedAt = Date.now();
-
-    return oldestSession;
   }
 
   /**
@@ -812,11 +785,10 @@ async function main(): Promise<void> {
   }
 
   console.log(`Processing ${productNames.length} products with ${sessions} concurrent session(s)...`);
-  console.log(`Session cooldown: ${intervalMs / 1000}s (backup safety limit)`);
   console.log(`Adaptive rate limiter will optimize request timing automatically.\n`);
 
   // Create session pool
-  const sessionPool = new SessionPool(sessions, intervalMs);
+  const sessionPool = new SessionPool(sessions);
 
   // Fetch products sequentially (one by one)
   // SessionPool controls timing - with N sessions, we'll use them in rotation
