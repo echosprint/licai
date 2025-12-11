@@ -112,7 +112,7 @@ const TIMING_CONFIG = {
   DEFAULT_INTERVAL_MS: 8000,
   MAX_RETRY_ATTEMPTS: 5,
   FALLBACK_SEARCH_PREFIX_LENGTH: 8,
-  CREDENTIAL_FETCH_COOLDOWN_MS: 2000, // Initial delay between credential requests (adaptive)
+  CREDENTIAL_FETCH_COOLDOWN_MS: 1000, // Initial delay between credential requests (adaptive)
   GLOBAL_REQUEST_COOLDOWN_MS: 1000, // Initial minimum delay between requests (adaptive)
 } as const;
 
@@ -300,13 +300,21 @@ class AdaptiveRateLimiter {
   // Success/failure tracking
   private recentSuccesses = 0;
   private recentFailures = 0;
-  private readonly ADAPTATION_WINDOW = 5; // Evaluate every 5 requests
+  private readonly ADAPTATION_WINDOW = 10; // Require more successes (10) to prevent premature speedup
+  private lastAdjustmentTime = 0; // Track when we last adjusted timing
+
+  // Anti-jiggling: minimum time between adjustments
+  private readonly MIN_ADJUSTMENT_INTERVAL_MS = 15000; // Wait at least 15s between speed changes
 
   // Min/max bounds for adaptive timing
   private readonly MIN_REQUEST_DELAY = 500;   // 0.5s minimum
   private readonly MAX_REQUEST_DELAY = 5000;  // 5s maximum
   private readonly MIN_CREDENTIAL_DELAY = 1000; // 1s minimum
   private readonly MAX_CREDENTIAL_DELAY = 10000; // 10s maximum
+
+  // Asymmetric adjustment rates (back off faster than speed up)
+  private readonly SPEEDUP_FACTOR = 0.95;  // Reduce by 5% (conservative)
+  private readonly BACKOFF_FACTOR = 1.5;   // Increase by 50% (aggressive)
 
   /**
    * Wait before fetching credentials (with adaptive timing)
@@ -343,45 +351,65 @@ class AdaptiveRateLimiter {
   /**
    * Report a successful API request
    * Gradually decreases delays on consistent success
+   * Anti-jiggling: requires multiple successes AND cooldown period before adjusting
    */
   reportSuccess(): void {
     this.recentSuccesses++;
     this.recentFailures = Math.max(0, this.recentFailures - 1);
 
-    // Every N successful requests, try reducing delay
-    if (this.recentSuccesses >= this.ADAPTATION_WINDOW) {
-      this.recentSuccesses = 0;
+    const now = Date.now();
+    const timeSinceLastAdjustment = now - this.lastAdjustmentTime;
 
-      // Speed up by 10%
+    // Anti-jiggling: Only adjust if we have enough successes AND enough time has passed
+    if (
+      this.recentSuccesses >= this.ADAPTATION_WINDOW &&
+      timeSinceLastAdjustment >= this.MIN_ADJUSTMENT_INTERVAL_MS
+    ) {
+      this.recentSuccesses = 0;
+      this.lastAdjustmentTime = now;
+
+      // Speed up conservatively (5% reduction)
+      const oldDelay = this.currentRequestDelay;
       this.currentRequestDelay = Math.max(
         this.MIN_REQUEST_DELAY,
-        Math.round(this.currentRequestDelay * 0.9)
+        Math.round(this.currentRequestDelay * this.SPEEDUP_FACTOR)
       );
 
-      console.log(`[Adaptive] 🎯 Speeding up: request delay now ${Math.round(this.currentRequestDelay / 1000)}s`);
+      // Only log if delay actually changed
+      if (this.currentRequestDelay !== oldDelay) {
+        console.log(`[Adaptive] 🎯 Speeding up: ${Math.round(oldDelay / 1000)}s → ${Math.round(this.currentRequestDelay / 1000)}s`);
+      }
     }
   }
 
   /**
    * Report a rate limit error (503, 429, etc.)
-   * Immediately increases delays to back off
+   * Immediately increases delays to back off (ignores cooldown for safety)
    */
   reportRateLimit(): void {
     this.recentFailures++;
     this.recentSuccesses = 0;
+    this.lastAdjustmentTime = Date.now(); // Reset adjustment timer
+
+    const oldRequestDelay = this.currentRequestDelay;
+    const oldCredentialDelay = this.currentCredentialDelay;
 
     // Back off aggressively: increase by 50%
     this.currentRequestDelay = Math.min(
       this.MAX_REQUEST_DELAY,
-      Math.round(this.currentRequestDelay * 1.5)
+      Math.round(this.currentRequestDelay * this.BACKOFF_FACTOR)
     );
 
     this.currentCredentialDelay = Math.min(
       this.MAX_CREDENTIAL_DELAY,
-      Math.round(this.currentCredentialDelay * 1.5)
+      Math.round(this.currentCredentialDelay * this.BACKOFF_FACTOR)
     );
 
-    console.log(`[Adaptive] ⚠️  Rate limited! Backing off: request=${Math.round(this.currentRequestDelay / 1000)}s, credential=${Math.round(this.currentCredentialDelay / 1000)}s`);
+    console.log(
+      `[Adaptive] ⚠️  Rate limited! Backing off:\n` +
+      `   Request: ${Math.round(oldRequestDelay / 1000)}s → ${Math.round(this.currentRequestDelay / 1000)}s\n` +
+      `   Credential: ${Math.round(oldCredentialDelay / 1000)}s → ${Math.round(this.currentCredentialDelay / 1000)}s`
+    );
   }
 
   /**
