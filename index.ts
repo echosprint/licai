@@ -853,7 +853,7 @@ async function main(): Promise<void> {
   const results = orderResults(productNames, resultsMap);
   const outputPath = path.resolve(outputFile);
   await writeCsv(results, outputPath);
-  logVerbose(`\n✓ Written ${results.length} rows to ${outputPath}`);
+  console.log(`\n--- Written ${results.length} products to ${outputPath} ---`);
 
   // Step 5: Print execution summary
   const elapsedTime = formatElapsedTime(startTime);
