@@ -136,6 +136,7 @@ let VERBOSE = false;
 const COLORS = {
   GREEN: "\x1b[32m",
   RED: "\x1b[31m",
+  GRAY: "\x1b[90m",
   RESET: "\x1b[0m",
 } as const;
 
@@ -153,11 +154,12 @@ async function delay(ms: number): Promise<void> {
 
 /**
  * Log message only if verbose mode is enabled
+ * Messages are displayed in gray color to distinguish from normal output
  * @param message - Message to log
  */
 function logVerbose(...args: any[]): void {
   if (VERBOSE) {
-    console.log(...args);
+    console.log(`${COLORS.GRAY}%s${COLORS.RESET}`, args.join(" "));
   }
 }
 
