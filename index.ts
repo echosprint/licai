@@ -109,11 +109,8 @@ const API_CONFIG = {
  * Timing and retry configuration
  */
 const TIMING_CONFIG = {
-  DEFAULT_INTERVAL_MS: 8000,
   MAX_RETRY_ATTEMPTS: 5,
   FALLBACK_SEARCH_PREFIX_LENGTH: 8,
-  CREDENTIAL_FETCH_COOLDOWN_MS: 1000, // Initial delay between credential requests (adaptive)
-  GLOBAL_REQUEST_COOLDOWN_MS: 1000, // Initial minimum delay between requests (adaptive)
 } as const;
 
 /**
