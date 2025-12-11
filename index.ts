@@ -301,10 +301,10 @@ async function searchProducts(
 /**
  * Fetch product information with intelligent fallback.
  *
- * Flow:
- * 1. Search with full product name (if not already tried)
- * 2. If no results, try with first 8 characters
- * 3. If multiple results, use exact matching to find best match
+ * Search Strategy:
+ * 1. First attempt: Search with full product name
+ * 2. If no results: Search with first 8 characters (prefix fallback)
+ * 3. Find exact match: Single result or exact match from multiple results
  *
  * @param item - Queue item tracking search state
  * @param credentials - API credentials for authentication
@@ -314,68 +314,106 @@ async function fetchProduct(
   item: ProductQueueItem,
   credentials: ApiCredentials
 ): Promise<ProductResult> {
-
-  // Increment attempt count once per call
   item.attemptCount++;
 
-  let results: Product[] = [];
+  // Step 1: Determine search term based on attempt history
+  const searchTerm = determineSearchTerm(item);
 
-  // If haven't tried full name yet, only search with full name
-  if (!item.triedFullName) {
-    try {
-      results = await searchProducts(item.name, credentials);
+  // Step 2: Search for products
+  const results = await performSearch(searchTerm, item, credentials);
 
-      // If empty, mark as tried and throw to re-queue for prefix search
-      if (results.length === 0) {
-        item.triedFullName = true;
-        console.log(`No results for full name "${item.name}", will retry with prefix`);
-        throw new Error("Empty results for full name search");
-      }
-    } catch (error) {
-      // Re-throw for retry
-      throw error;
-    }
-  } else {
-    // Already tried full name, now try prefix fallback
-    const prefixLength = TIMING_CONFIG.FALLBACK_SEARCH_PREFIX_LENGTH;
-    const prefix = item.name.slice(0, prefixLength);
-    console.log(
-      `Trying prefix search (first ${prefixLength} chars): "${prefix}"`
-    );
+  // Step 3: Find exact match from results
+  const match = findProductMatch(results, item);
 
-    try {
-      results = await searchProducts(prefix, credentials);
-
-      if (results.length === 0) {
-        // Both full name and prefix failed - mark as failed
-        item.success = false;
-        console.log(
-          `No products found for "${item.name}" (tried both full name and prefix), returning empty code`
-        );
-        return { prodName: item.name, prodRegCode: "" };
-      }
-    } catch (error) {
-      // Re-throw for retry
-      throw error;
-    }
-  }
-
-  // Find exact match from results
-  const selected = results.length === 1 ? results[0] : findExactMatch(item.name, results);
-
-  if (!selected) {
-    // No exact match - mark as failed
+  // Step 4: Return result
+  if (!match) {
     item.success = false;
     console.log(`No exact match found for "${item.name}", returning empty code`);
     return { prodName: item.name, prodRegCode: "" };
   }
 
-  // Successfully found product
   item.success = true;
   return {
-    prodName: selected.prodName,
-    prodRegCode: selected.prodRegCode ?? "",
+    prodName: match.prodName,
+    prodRegCode: match.prodRegCode ?? "",
   };
+}
+
+/**
+ * Determine what search term to use based on previous attempts.
+ *
+ * @param item - Queue item with attempt history
+ * @returns Search term (full name or prefix)
+ */
+function determineSearchTerm(item: ProductQueueItem): string {
+  if (!item.triedFullName) {
+    // First attempt: use full name
+    return item.name;
+  }
+
+  // Fallback: use prefix
+  const prefix = item.name.slice(0, TIMING_CONFIG.FALLBACK_SEARCH_PREFIX_LENGTH);
+  console.log(
+    `Trying prefix search (first ${TIMING_CONFIG.FALLBACK_SEARCH_PREFIX_LENGTH} chars): "${prefix}"`
+  );
+  return prefix;
+}
+
+/**
+ * Perform search and handle empty results.
+ * Throws error to trigger retry if appropriate.
+ *
+ * @param searchTerm - Term to search for
+ * @param item - Queue item to update state
+ * @param credentials - API credentials
+ * @returns Array of matching products (may be empty)
+ */
+async function performSearch(
+  searchTerm: string,
+  item: ProductQueueItem,
+  credentials: ApiCredentials
+): Promise<Product[]> {
+  const results = await searchProducts(searchTerm, credentials);
+
+  // Handle empty results
+  if (results.length === 0) {
+    if (!item.triedFullName) {
+      // Mark full name as tried and trigger retry with prefix
+      item.triedFullName = true;
+      console.log(`No results for full name "${item.name}", will retry with prefix`);
+      throw new Error("Empty results for full name search");
+    }
+
+    // Both strategies failed - no retry needed
+    item.success = false;
+    console.log(
+      `No products found for "${item.name}" (tried both full name and prefix)`
+    );
+  }
+
+  return results;
+}
+
+/**
+ * Find exact product match from search results.
+ * Single result is accepted directly; multiple results require exact match after normalization.
+ *
+ * @param results - Products returned from search
+ * @param item - Queue item with original product name
+ * @returns Exact matching product or null if no match found
+ */
+function findProductMatch(results: Product[], item: ProductQueueItem): Product | null {
+  if (results.length === 0) {
+    return null;
+  }
+
+  // Always use exact match, even for single results
+  const exactMatch = findExactMatch(item.name, results);
+  if (!exactMatch) {
+    console.log(`No exact match found for "${item.name}"`);
+  }
+
+  return exactMatch;
 }
 
 /**
