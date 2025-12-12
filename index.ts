@@ -19,8 +19,6 @@ interface Product {
  * Response from the initialization endpoint containing RSA public key
  */
 interface ApiInitResponse {
-  code?: number | string;
-  msg?: string;
   data?: string; // RSA public key for signing requests
 }
 
@@ -28,11 +26,8 @@ interface ApiInitResponse {
  * Response from the product search endpoint
  */
 interface ProductListResponse {
-  code?: number | string;
-  msg?: string;
   data?: {
     list?: Product[];
-    total?: number;
   };
 }
 
@@ -453,7 +448,7 @@ async function performSearch(
 
 /**
  * Find exact product match from search results.
- * Single result is accepted directly; multiple results require exact match after normalization.
+ * Requires exact match after normalization, even for single results.
  *
  * @param results - Products returned from search
  * @param item - Queue item with original product name
@@ -464,7 +459,6 @@ function findProductMatch(results: Product[], item: ProductQueueItem): Product |
     return null;
   }
 
-  // Always use exact match, even for single results
   const exactMatch = findExactMatch(item.name, results);
   if (!exactMatch) {
     logVerbose(`No exact match found for "${item.name}"`);
@@ -544,21 +538,13 @@ function isValidProductName(name: string): boolean {
   }
 
   // Must not be too long (reasonable limit)
-  if (name.length > 200) {
-    return false;
-  }
-
-  // Must contain at least one non-whitespace character
-  return /\S/.test(name);
+  return name.length <= 200;
 }
 
 /**
  * Read and parse product names from input file.
- * Cleans up lines by:
- * - Trimming whitespace
- * - Removing quotes (English & Chinese)
- * - Removing all spaces
- * - Filtering invalid names
+ * Cleans up lines by trimming whitespace, removing quotes,
+ * removing all spaces, and filtering invalid names.
  *
  * @param filePath - Path to input file
  * @returns Array of cleaned product names
@@ -570,7 +556,6 @@ async function readLines(filePath: string): Promise<string[]> {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .map((line) => line.replace(/^["'"']|["'"']$/g, "")) // Remove quotes
-    .map((line) => line.trim())
     .map((line) => line.replace(/\s+/g, "")) // Remove all spaces
     .filter((line) => line.length > 0 && isValidProductName(line));
 }
