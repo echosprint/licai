@@ -9,6 +9,7 @@ This project provides both **TypeScript** and **Bash** implementations:
 ### TypeScript Version (index.ts)
 
 Production-ready implementation following TypeScript best practices with:
+
 - ✅ **Intelligent fallback search**: If full name not found, tries first 8 characters
 - ✅ **Similarity matching**: Finds best match using longest common prefix algorithm
 - ✅ **Graceful handling**: Returns empty code for products not found (continues processing)
