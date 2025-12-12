@@ -16,26 +16,6 @@ interface Product {
 }
 
 /**
- * Custom error for API-related failures
- */
-class ApiError extends Error {
-  constructor(message: string, public readonly statusCode?: number) {
-    super(message);
-    this.name = "ApiError";
-  }
-}
-
-/**
- * Custom error for search-related failures (triggers retry)
- */
-class SearchError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "SearchError";
-  }
-}
-
-/**
  * Response from the initialization endpoint containing RSA public key
  */
 interface ApiInitResponse {
@@ -361,9 +341,8 @@ async function searchProducts(
   });
 
   if (!response.ok) {
-    throw new ApiError(
-      `Request failed: ${response.status} ${response.statusText}`,
-      response.status
+    throw new Error(
+      `Request failed: ${response.status} ${response.statusText}`
     );
   }
 
@@ -459,7 +438,7 @@ async function performSearch(
       // Mark full name as tried and trigger retry with prefix
       item.triedFullName = true;
       logVerbose(`No results for full name "${item.name}", will retry with prefix`);
-      throw new SearchError("Empty results for full name search");
+      throw new Error("Empty results for full name search");
     }
 
     // Both strategies failed - no retry needed
